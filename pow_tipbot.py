@@ -242,28 +242,27 @@ def is_admin(interaction: discord.Interaction) -> bool:
 @bot.tree.command(name="help", description="Show tip bot commands.")
 async def help_cmd(interaction: discord.Interaction):
     text = (
-        "**TipBot – Faucet Credits (internal ledger + withdraw)**\n"
-        "• `/register_address <address>` – Register your 40-hex faucet address (no existence check).\n"
-        "• `/balance` – Show your TipBot balance.\n"
-        "• `/tip @user <amount> [note]` – Tip internal credits to another user.\n"
-        "• `/withdraw <amount>` – Withdraw to your registered faucet address (via bot treasury).\n\n"
+        "**HCC TipBot**\n"
+        "• `/register_address <address>` – Register your 40-hex HCC address (no existence check).\n"
+        "• `/balance` – Show your discord account's internal HCC balance.\n"
+        "• `/tip @user <amount> [note]` – Tip HCC to another user.\n"
+        "• `/withdraw <amount>` – Withdraw HCC from your discord account to your registered HCC address.\n\n"
         f"Withdraw policy:\n"
         f"• Min: `{MIN_WITHDRAW}`\n"
         f"• Cooldown: `{WITHDRAW_COOLDOWN}s`\n"
         f"• Max per day: `{MAX_WITHDRAW_PER_DAY}`\n\n"
         "Notes:\n"
         "• This bot uses an internal ledger (no deposits).\n"
-        "• Withdraw uses the faucet `/transfer` from the bot treasury.\n"
-        "• If your faucet address does not exist yet, withdraw will fail (unknown recipient).\n"
+        "• If your HCC address does not exist yet, withdraw will fail (unknown recipient).\n"
     )
     await interaction.response.send_message(text, ephemeral=True)
 
 
 @bot.tree.command(
     name="register_address",
-    description="Register your faucet address (40 hex). No existence check."
+    description="Register your HCC address (40 hex). No existence check."
 )
-@app_commands.describe(address="Your faucet address (40 hex characters)")
+@app_commands.describe(address="Your HCC address (40 hex characters)")
 async def register_address(interaction: discord.Interaction, address: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
 
@@ -279,7 +278,7 @@ async def register_address(interaction: discord.Interaction, address: str):
     # Bonus protection: do not allow registering the treasury address
     if bot.treasury_address and addr == bot.treasury_address:
         await interaction.followup.send(
-            "That address is the **bot treasury** address. Please register your own faucet address.",
+            "That address is the **bot treasury** address. Please register your own HCC address.",
             ephemeral=True
         )
         return
@@ -315,14 +314,14 @@ async def balance(interaction: discord.Interaction):
         u = get_or_create_user(con, interaction.user.id)
         addr = u.get("address") or "(not set)"
         await interaction.response.send_message(
-            f"Balance: **{u['balance']}** credits\nRegistered faucet address: `{addr}`",
+            f"Balance: **{u['balance']}** HCC\nRegistered HCC address: `{addr}`",
             ephemeral=True
         )
     finally:
         con.close()
 
 
-@bot.tree.command(name="tip", description="Tip internal faucet credits to another user.")
+@bot.tree.command(name="tip", description="Tip HCC to another user.")
 @app_commands.describe(user="Recipient", amount="Amount to tip", note="Optional note")
 async def tip(interaction: discord.Interaction, user: discord.User, amount: int, note: Optional[str] = None):
     await interaction.response.defer(ephemeral=True, thinking=True)
@@ -376,18 +375,18 @@ async def tip(interaction: discord.Interaction, user: discord.User, amount: int,
         try:
             note_txt = f" — {note}" if note else ""
             await interaction.channel.send(
-                f"💸 {interaction.user.mention} tipped {user.mention} **{amount}** credits{note_txt}"
+                f"💸 {interaction.user.mention} tipped {user.mention} **{amount}** HCC{note_txt}"
             )
         except Exception:
             pass
 
     await interaction.followup.send(
-        f"Tip sent ✅ You tipped {user.mention} **{amount}** credits.",
+        f"Tip sent ✅ You tipped {user.mention} **{amount}** HCC.",
         ephemeral=True
     )
 
 
-@bot.tree.command(name="withdraw", description="Withdraw to your registered faucet address (via bot treasury).")
+@bot.tree.command(name="withdraw", description="Withdraw to your registered HCC address (via bot treasury).")
 @app_commands.describe(amount="Amount to withdraw")
 async def withdraw(interaction: discord.Interaction, amount: int):
     await interaction.response.defer(ephemeral=True, thinking=True)
@@ -419,7 +418,7 @@ async def withdraw(interaction: discord.Interaction, amount: int):
 
         if not to_addr:
             con.execute("ROLLBACK;")
-            await interaction.followup.send("No faucet address registered. Use `/register_address` first.", ephemeral=True)
+            await interaction.followup.send("No HCC address registered. Use `/register_address` first.", ephemeral=True)
             return
 
         # basic sanity
@@ -427,7 +426,7 @@ async def withdraw(interaction: discord.Interaction, amount: int):
             to_addr = normalize_addr(to_addr)
         except Exception:
             con.execute("ROLLBACK;")
-            await interaction.followup.send("Your stored faucet address has an invalid format. Please re-register.", ephemeral=True)
+            await interaction.followup.send("Your stored HCC address has an invalid format. Please re-register.", ephemeral=True)
             return
 
         # bonus protection
@@ -522,13 +521,13 @@ async def withdraw(interaction: discord.Interaction, amount: int):
                     if PUBLIC_SHOW_ADDRESS:
                         extra = f" (addr {to_addr[:6]}…{to_addr[-6:]})"
                     await interaction.channel.send(
-                        f"🏧 {interaction.user.mention} withdrew **{amount}** credits{extra}"
+                        f"🏧 {interaction.user.mention} withdrew **{amount}** HCC{extra}"
                     )
                 except Exception:
                     pass
 
             await interaction.followup.send(
-                f"Withdraw successful ✅ Sent **{amount}** credits to `{to_addr}`.\n",
+                f"Withdraw successful ✅ Sent **{amount}** HCC to `{to_addr}`.\n",
                 ephemeral=True
             )
             return
@@ -558,11 +557,11 @@ async def withdraw(interaction: discord.Interaction, amount: int):
     if err_msg:
         if "unknown recipient address" in err_msg or "(404)" in err_msg:
             hint = (
-                "\n\nHint: Your faucet address is **unknown** to the faucet server. "
+                "\n\nHint: Your HCC address is **unknown** to the faucet server. "
                 "Create it first via PoW signup and ensure the 40-hex address is correct."
             )
-        elif "insufficient credits" in err_msg or "(400)" in err_msg:
-            hint = "\n\nHint: Bot treasury has insufficient faucet credits right now. Ask admin to top it up."
+        elif "insufficient HCC" in err_msg or "(400)" in err_msg:
+            hint = "\n\nHint: Bot treasury has insufficient HCC right now. Ask admin to top it up."
 
     await interaction.followup.send(
         f"Withdraw failed ❌ The reserved amount was refunded.\nError: `{err_msg}`{hint}",
@@ -570,7 +569,7 @@ async def withdraw(interaction: discord.Interaction, amount: int):
     )
 
 
-@bot.tree.command(name="whoami", description="Show your registered faucet address and basic limits.")
+@bot.tree.command(name="whoami", description="Show your registered HCC address and basic limits.")
 async def whoami(interaction: discord.Interaction):
     con = db()
     try:
@@ -579,7 +578,7 @@ async def whoami(interaction: discord.Interaction):
         dk = day_key()
         wd = get_withdrawn_today(con, interaction.user.id, dk)
         await interaction.response.send_message(
-            f"Registered faucet address: `{addr}`\n"
+            f"Registered HCC address: `{addr}`\n"
             f"TipBot balance: **{u['balance']}**\n"
             f"Withdraw today: `{wd}/{MAX_WITHDRAW_PER_DAY}`\n"
             f"Withdraw cooldown: `{WITHDRAW_COOLDOWN}s` | Min withdraw: `{MIN_WITHDRAW}`",
@@ -592,7 +591,7 @@ async def whoami(interaction: discord.Interaction):
 # ---------------------------
 # Admin commands
 # ---------------------------
-@bot.tree.command(name="grant", description="(Admin) Grant internal credits to a user.")
+@bot.tree.command(name="grant", description="(Admin) Grant internal HCC to a user.")
 @app_commands.describe(user="Recipient", amount="Amount to grant", note="Optional note")
 async def grant(interaction: discord.Interaction, user: discord.User, amount: int, note: Optional[str] = None):
     await interaction.response.defer(ephemeral=True, thinking=True)
@@ -625,7 +624,7 @@ async def grant(interaction: discord.Interaction, user: discord.User, amount: in
     finally:
         con.close()
 
-    await interaction.followup.send(f"Granted ✅ {user.mention} received **{amount}** credits.", ephemeral=True)
+    await interaction.followup.send(f"Granted ✅ {user.mention} received **{amount}** HCC.", ephemeral=True)
 
 
 def main():
