@@ -528,8 +528,7 @@ async def withdraw(interaction: discord.Interaction, amount: int):
                     pass
 
             await interaction.followup.send(
-                f"Withdraw successful ✅ Sent **{amount}** credits to `{to_addr}`.\n"
-                f"Faucet response: `{resp}`",
+                f"Withdraw successful ✅ Sent **{amount}** credits to `{to_addr}`.\n",
                 ephemeral=True
             )
             return
