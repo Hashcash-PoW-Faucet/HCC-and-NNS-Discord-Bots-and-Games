@@ -205,6 +205,12 @@ class TipBot(discord.Client):
     async def setup_hook(self):
         init_db()
 
+        if os.getenv("PURGE_GLOBAL", "0") == "1":
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync()
+            print("Purged global commands.")
+            raise SystemExit(0)
+
         # Resolve treasury address once (bonus protection)
         if TIPBOT_TREASURY_SECRET:
             try:
