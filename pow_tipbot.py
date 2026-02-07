@@ -311,13 +311,13 @@ def is_admin(interaction: discord.Interaction) -> bool:
 async def help_cmd(interaction: discord.Interaction):
     text = (
         "**HCC TipBot**\n"
-        "• `/register_address <address>` – Register website HCC address for withdrawals (for deposits use /link_account)\n"
+        "• `/register_address <address>` – Register HCC address for withdrawals (for deposits use /link_account)\n"
         "• `/balance` – Show your discord account's internal HCC balance.\n"
-        "• `/link_account` – Link with a Hascash website account (requires private key) for deposits.\n"
-        "• `/unlink_account` – Remove your linked website account.\n"
+        "• `/link_account` – Link with a Hashcash account for deposits (requires private key). \n"
+        "• `/unlink_account` – Remove your deposit account.\n"
         "• `/deposit <amount|max>` – Move HCC from your website account into your Discord balance.\n"
         "• `/tip @user <amount> [note]` – Tip HCC to another user.\n"
-        "• `/withdraw <amount>` – Withdraw HCC from your discord account to your registered HCC withdrawal address.\n\n"
+        "• `/withdraw <amount>` – Withdraw HCC from your discord account to your registered withdrawal address.\n\n"
         f"Withdraw policy:\n"
         f"• Min: `{MIN_WITHDRAW}`\n"
         f"• Cooldown: `{WITHDRAW_COOLDOWN}s`\n"
