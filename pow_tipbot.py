@@ -11,6 +11,14 @@ import discord
 from discord import app_commands
 import aiohttp
 
+import base64
+
+# Optional encryption (recommended). If unavailable or key missing, we fall back to plaintext.
+try:
+    from cryptography.fernet import Fernet  # type: ignore
+except Exception:
+    Fernet = None  # type: ignore
+
 load_dotenv()
 
 # ---------------------------
@@ -36,8 +44,12 @@ PUBLIC_SHOW_ADDRESS = os.environ.get("PUBLIC_SHOW_ADDRESS", "0").strip() == "1"
 # Optional: speed up slash-command sync by limiting to one guild during development
 GUILD_ID = os.environ.get("GUILD_ID", "").strip()
 
-# Faucet address format (derived from sha256(secret).hexdigest()[:40])
+# HCC address format (derived from sha256(secret).hexdigest()[:40])
 ADDR_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+
+# Hashcash website account linking (C2): store user private keys for one-click deposits.
+# Recommended: set TIPBOT_FERNET_KEY (Fernet key). If not set, secrets are stored plaintext.
+TIPBOT_FERNET_KEY = os.environ.get("TIPBOT_FERNET_KEY", "").strip()
 
 
 # ---------------------------
@@ -59,6 +71,48 @@ def normalize_addr(addr: str) -> str:
     return addr.lower()
 
 
+# --- Private key encryption helpers ---
+def _get_fernet():
+    if not TIPBOT_FERNET_KEY or Fernet is None:
+        return None
+    try:
+        return Fernet(TIPBOT_FERNET_KEY.encode("utf-8"))
+    except Exception:
+        return None
+
+
+def encrypt_secret(secret: str) -> str:
+    secret = (secret or "").strip()
+    if not secret:
+        return ""
+    f = _get_fernet()
+    if f is None:
+        # plaintext fallback (centralized system; user opted in)
+        return "plain:" + secret
+    token = f.encrypt(secret.encode("utf-8"))
+    return "fernet:" + token.decode("utf-8")
+
+
+def decrypt_secret(stored: Optional[str]) -> str:
+    stored = (stored or "").strip()
+    if not stored:
+        return ""
+    if stored.startswith("plain:"):
+        return stored[len("plain:"):]
+    if stored.startswith("fernet:"):
+        token = stored[len("fernet:"):].encode("utf-8")
+        f = _get_fernet()
+        if f is None:
+            # key missing -> cannot decrypt
+            return ""
+        try:
+            return f.decrypt(token).decode("utf-8")
+        except Exception:
+            return ""
+    # Unknown format
+    return ""
+
+
 def db() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)  # autocommit
     con.execute("PRAGMA journal_mode=WAL;")
@@ -72,12 +126,18 @@ def init_db() -> None:
     CREATE TABLE IF NOT EXISTS users (
       discord_id INTEGER PRIMARY KEY,
       address TEXT,
+      website_secret TEXT,
       balance INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       last_withdraw_at INTEGER NOT NULL DEFAULT 0
     );
     """)
+    # Backward-compatible migration (older DBs): add website_secret column if missing.
+    try:
+        con.execute("ALTER TABLE users ADD COLUMN website_secret TEXT;")
+    except Exception:
+        pass
     con.execute("""
     CREATE TABLE IF NOT EXISTS daily_limits (
       discord_id INTEGER NOT NULL,
@@ -90,7 +150,7 @@ def init_db() -> None:
     CREATE TABLE IF NOT EXISTS tx_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       ts INTEGER NOT NULL,
-      type TEXT NOT NULL,          -- tip | grant | withdraw
+      type TEXT NOT NULL,          -- tip | grant | withdraw | deposit
       from_id INTEGER,
       to_id INTEGER,
       amount INTEGER NOT NULL,
@@ -105,26 +165,28 @@ def init_db() -> None:
 
 def get_or_create_user(con: sqlite3.Connection, discord_id: int) -> Dict[str, Any]:
     row = con.execute(
-        "SELECT discord_id, address, balance, created_at, updated_at, last_withdraw_at FROM users WHERE discord_id=?",
+        "SELECT discord_id, address, website_secret, balance, created_at, updated_at, last_withdraw_at FROM users WHERE discord_id=?",
         (discord_id,)
     ).fetchone()
     if row:
         return {
             "discord_id": int(row[0]),
             "address": row[1],
-            "balance": int(row[2]),
-            "created_at": int(row[3]),
-            "updated_at": int(row[4]),
-            "last_withdraw_at": int(row[5]),
+            "website_secret": row[2],
+            "balance": int(row[3]),
+            "created_at": int(row[4]),
+            "updated_at": int(row[5]),
+            "last_withdraw_at": int(row[6]),
         }
     ts = now_ts()
     con.execute(
-        "INSERT INTO users(discord_id, address, balance, created_at, updated_at, last_withdraw_at) VALUES(?,?,?,?,?,0)",
-        (discord_id, None, 0, ts, ts)
+        "INSERT INTO users(discord_id, address, website_secret, balance, created_at, updated_at, last_withdraw_at) VALUES(?,?,?,?,?,?,0)",
+        (discord_id, None, None, 0, ts, ts)
     )
     return {
         "discord_id": discord_id,
         "address": None,
+        "website_secret": None,
         "balance": 0,
         "created_at": ts,
         "updated_at": ts,
@@ -162,7 +224,7 @@ def has_pending_withdraw(con: sqlite3.Connection, discord_id: int) -> bool:
 
 
 # ---------------------------
-# Faucet API calls (matches your FastAPI app.py)
+# Hashcash backend API calls (matches your FastAPI app.py)
 # ---------------------------
 async def api_get_me(session: aiohttp.ClientSession, secret: str) -> Dict[str, Any]:
     url = f"{FAUCET_API_BASE}/me"
@@ -251,14 +313,18 @@ async def help_cmd(interaction: discord.Interaction):
         "**HCC TipBot**\n"
         "• `/register_address <address>` – Register your 40-hex HCC address (no existence check).\n"
         "• `/balance` – Show your discord account's internal HCC balance.\n"
+        "• `/link_account` – Link with your Hascash website account (requires private key) for one-click deposits.\n"
+        "• `/unlink_account` – Remove your linked website account.\n"
+        "• `/deposit <amount|max>` – Move HCC from your website account into your Discord balance.\n"
         "• `/tip @user <amount> [note]` – Tip HCC to another user.\n"
-        "• `/withdraw <amount>` – Withdraw HCC from your discord account to your registered HCC address.\n\n"
+        "• `/withdraw <amount>` – Withdraw HCC from your discord account to your registered HCC website address.\n\n"
         f"Withdraw policy:\n"
         f"• Min: `{MIN_WITHDRAW}`\n"
         f"• Cooldown: `{WITHDRAW_COOLDOWN}s`\n"
         f"• Max per day: `{MAX_WITHDRAW_PER_DAY}`\n\n"
         "Notes:\n"
-        "• This bot uses an internal ledger (no deposits).\n"
+        "• This bot uses an internal ledger. You can optionally link your Hashcash website account and deposit into Discord.\n"
+        "  Use `/link_account` + `/deposit` to top up your Discord balance.\n"
         "• If your HCC address does not exist yet, withdraw will fail (unknown recipient).\n"
     )
     await interaction.response.send_message(text, ephemeral=True)
@@ -325,6 +391,220 @@ async def balance(interaction: discord.Interaction):
         )
     finally:
         con.close()
+
+
+# ---------------------------
+# Website account linking and deposit commands
+# ---------------------------
+
+class LinkAccountModal(discord.ui.Modal, title="Link Website Account"):
+    website_secret = discord.ui.TextInput(
+        label="Website private key",
+        style=discord.TextStyle.paragraph,
+        placeholder="Paste your private key from your website account.",
+        required=True,
+        max_length=5000,
+    )
+
+    def __init__(self, requester_id: int):
+        super().__init__()
+        self.requester_id = int(requester_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("This modal is not for you.", ephemeral=True)
+            return
+
+        secret = str(self.website_secret.value or "").strip()
+        if not secret:
+            await interaction.response.send_message("Missing secret.", ephemeral=True)
+            return
+
+        # Verify the secret via /me
+        try:
+            async with aiohttp.ClientSession() as session:
+                me = await api_get_me(session, secret)
+                acct = me.get("account_id")
+        except Exception as e:
+            await interaction.response.send_message(f"Link failed ❌ Could not verify secret: `{e}`", ephemeral=True)
+            return
+
+        if not isinstance(acct, str) or not ADDR_RE.match(acct):
+            await interaction.response.send_message("Link failed ❌ API endpoint /me returned an invalid account_id.", ephemeral=True)
+            return
+
+        # Prevent linking the bot treasury (user could shoot themselves in the foot)
+        if bot.treasury_address and acct.lower() == bot.treasury_address:
+            await interaction.response.send_message(
+                "Safety check: this secret belongs to the **bot treasury** account. Please link your own website account.",
+                ephemeral=True,
+            )
+            return
+
+        stored = encrypt_secret(secret)
+        con = db()
+        try:
+            con.execute("BEGIN IMMEDIATE;")
+            get_or_create_user(con, interaction.user.id)
+            con.execute(
+                "UPDATE users SET website_secret=?, updated_at=? WHERE discord_id=?",
+                (stored, now_ts(), interaction.user.id),
+            )
+            con.execute("COMMIT;")
+        except Exception:
+            try:
+                con.execute("ROLLBACK;")
+            except Exception:
+                pass
+            raise
+        finally:
+            con.close()
+
+        enc_note = "encrypted" if (stored.startswith("fernet:") and _get_fernet() is not None) else "plaintext"
+        key_hint = "" if enc_note == "encrypted" else " (Tip: set TIPBOT_FERNET_KEY to encrypt secrets at rest.)"
+
+        await interaction.response.send_message(
+            f"Linked ✅ Website Hashcash account: `{acct.lower()}`\nStored secret: **{enc_note}**{key_hint}\nYou can now use `/deposit`.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="link_account", description="Link your website account for direct deposits (note: private key is stored encrypted).")
+async def link_account(interaction: discord.Interaction):
+    await interaction.response.send_modal(LinkAccountModal(interaction.user.id))
+
+
+@bot.tree.command(name="unlink_account", description="Remove your website account secret.")
+async def unlink_account(interaction: discord.Interaction):
+    con = db()
+    try:
+        con.execute("BEGIN IMMEDIATE;")
+        get_or_create_user(con, interaction.user.id)
+        con.execute("UPDATE users SET website_secret=NULL, updated_at=? WHERE discord_id=?", (now_ts(), interaction.user.id))
+        con.execute("COMMIT;")
+    except Exception:
+        try:
+            con.execute("ROLLBACK;")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+    await interaction.response.send_message("Unlinked ✅ Your website account was unlinked.", ephemeral=True)
+
+
+@bot.tree.command(name="deposit", description="Deposit HCC from your website account into your Discord balance.")
+@app_commands.describe(amount="Amount to deposit (integer) or 'max'")
+async def deposit(interaction: discord.Interaction, amount: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    if not bot.treasury_address:
+        await interaction.followup.send(
+            "Bot treasury address not resolved. Please ensure TIPBOT_TREASURY_SECRET is set and the Hashcash backend is reachable.",
+            ephemeral=True,
+        )
+        return
+
+    # Load linked secret
+    con = db()
+    try:
+        u = get_or_create_user(con, interaction.user.id)
+        stored = u.get("website_secret")
+    finally:
+        con.close()
+
+    secret = decrypt_secret(stored)
+    if not secret:
+        await interaction.followup.send(
+            "No Hashcash website account linked. Use `/link_account` first (ephemeral).",
+            ephemeral=True,
+        )
+        return
+
+    # Determine deposit amount
+    try:
+        async with aiohttp.ClientSession() as session:
+            me = await api_get_me(session, secret)
+            account_balance = int(me.get("credits") or me.get("balance") or me.get("hcc") or 0)
+    except Exception as e:
+        await interaction.followup.send(f"Deposit failed ❌ Could not read website account balance: `{e}`", ephemeral=True)
+        return
+
+    amt_str = (amount or "").strip().lower()
+    if amt_str == "max":
+        dep_amount = account_balance
+    else:
+        try:
+            dep_amount = int(amt_str)
+        except Exception:
+            await interaction.followup.send("Amount must be an integer or `max`.", ephemeral=True)
+            return
+
+    if dep_amount <= 0:
+        await interaction.followup.send("Nothing to deposit.", ephemeral=True)
+        return
+
+    if dep_amount > account_balance:
+        await interaction.followup.send(
+            f"Insufficient account balance. Account balance: **{account_balance}** HCC.",
+            ephemeral=True,
+        )
+        return
+
+    # 1) Perform account transfer: user -> bot treasury
+    try:
+        async with aiohttp.ClientSession() as session:
+            resp = await api_transfer(session, secret, bot.treasury_address, dep_amount)
+    except Exception as e:
+        await interaction.followup.send(f"Deposit failed ❌ HCC transfer failed: `{e}`", ephemeral=True)
+        return
+
+    # 2) Credit internal ledger (atomic)
+    con2 = db()
+    try:
+        con2.execute("BEGIN IMMEDIATE;")
+        get_or_create_user(con2, interaction.user.id)
+        ts = now_ts()
+        con2.execute(
+            "UPDATE users SET balance = balance + ?, updated_at=? WHERE discord_id=?",
+            (dep_amount, ts, interaction.user.id),
+        )
+        try:
+            con2.execute(
+                "INSERT INTO tx_log(ts, type, from_id, to_id, amount, note, status, faucet_resp) VALUES(?,?,?,?,?,?,?,?,?)",
+                (ts, "deposit", None, interaction.user.id, dep_amount, "deposit from website account", "ok", json.dumps(resp, ensure_ascii=False)),
+            )
+        except Exception:
+            # fallback if schema differs
+            con2.execute(
+                "INSERT INTO tx_log(ts, type, from_id, to_id, amount, note, status, faucet_resp) VALUES(?,?,?,?,?,?,?,?)",
+                (ts, "deposit", None, interaction.user.id, dep_amount, "deposit from website account", "ok", json.dumps(resp, ensure_ascii=False)),
+            )
+        con2.execute("COMMIT;")
+    except Exception:
+        try:
+            con2.execute("ROLLBACK;")
+        except Exception:
+            pass
+        raise
+    finally:
+        con2.close()
+
+    # Show new internal balance
+    con3 = db()
+    try:
+        u3 = get_or_create_user(con3, interaction.user.id)
+        new_bal = int(u3.get("balance") or 0)
+    finally:
+        con3.close()
+
+    await interaction.followup.send(
+        f"Deposit successful ✅\nMoved **{dep_amount} HCC** from your website account into your Discord balance.\n"
+        f"Your TipBot balance: **{new_bal} HCC**\n\n"
+        "To cash out to your HCC address: use `/withdraw` in the TipBot.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="tip", description="Tip HCC to another user.")
@@ -492,7 +772,7 @@ async def withdraw(interaction: discord.Interaction, amount: int):
     finally:
         con.close()
 
-    # 2) Call faucet /transfer (outside DB lock)
+    # 2) Call website account /transfer (outside DB lock)
     ok = False
     resp = None
     err_msg = None
@@ -558,12 +838,12 @@ async def withdraw(interaction: discord.Interaction, amount: int):
     finally:
         con2.close()
 
-    # Friendly hints for common faucet errors
+    # Friendly hints for common errors
     hint = ""
     if err_msg:
         if "unknown recipient address" in err_msg or "(404)" in err_msg:
             hint = (
-                "\n\nHint: Your HCC address is **unknown** to the faucet server. "
+                "\n\nHint: Your HCC address is **unknown** to the Hashcash server. "
                 "Create it first via PoW signup and ensure the 40-hex address is correct."
             )
         elif "insufficient HCC" in err_msg or "(400)" in err_msg:
