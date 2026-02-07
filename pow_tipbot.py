@@ -311,13 +311,13 @@ def is_admin(interaction: discord.Interaction) -> bool:
 async def help_cmd(interaction: discord.Interaction):
     text = (
         "**HCC TipBot**\n"
-        "• `/register_address <address>` – Register your 40-hex HCC address (no existence check).\n"
+        "• `/register_address <address>` – Register website HCC address for withdrawals (for deposits use /link_account)\n"
         "• `/balance` – Show your discord account's internal HCC balance.\n"
-        "• `/link_account` – Link with your Hascash website account (requires private key) for one-click deposits.\n"
+        "• `/link_account` – Link with a Hascash website account (requires private key) for deposits.\n"
         "• `/unlink_account` – Remove your linked website account.\n"
         "• `/deposit <amount|max>` – Move HCC from your website account into your Discord balance.\n"
         "• `/tip @user <amount> [note]` – Tip HCC to another user.\n"
-        "• `/withdraw <amount>` – Withdraw HCC from your discord account to your registered HCC website address.\n\n"
+        "• `/withdraw <amount>` – Withdraw HCC from your discord account to your registered HCC withdrawal address.\n\n"
         f"Withdraw policy:\n"
         f"• Min: `{MIN_WITHDRAW}`\n"
         f"• Cooldown: `{WITHDRAW_COOLDOWN}s`\n"
@@ -403,7 +403,7 @@ class LinkAccountModal(discord.ui.Modal, title="Link Website Account"):
         style=discord.TextStyle.paragraph,
         placeholder="Paste your private key from your website account.",
         required=True,
-        max_length=5000,
+        max_length=4000,
     )
 
     def __init__(self, requester_id: int):
@@ -464,7 +464,7 @@ class LinkAccountModal(discord.ui.Modal, title="Link Website Account"):
         key_hint = "" if enc_note == "encrypted" else " (Tip: set TIPBOT_FERNET_KEY to encrypt secrets at rest.)"
 
         await interaction.response.send_message(
-            f"Linked ✅ Website Hashcash account: `{acct.lower()}`\nStored secret: **{enc_note}**{key_hint}\nYou can now use `/deposit`.",
+            f"Linked ✅ Website Hashcash account: `{acct.lower()}`\nYou can now use `/deposit`.",
             ephemeral=True,
         )
 
@@ -547,7 +547,7 @@ async def deposit(interaction: discord.Interaction, amount: str):
 
     if dep_amount > account_balance:
         await interaction.followup.send(
-            f"Insufficient account balance. Account balance: **{account_balance}** HCC.",
+            f"Insufficient deposit account balance. Balance of linked account: **{account_balance}** HCC.",
             ephemeral=True,
         )
         return
@@ -860,15 +860,38 @@ async def whoami(interaction: discord.Interaction):
     con = db()
     try:
         u = get_or_create_user(con, interaction.user.id)
-        addr = u.get("address") or "(not set)"
         dk = day_key()
         wd = get_withdrawn_today(con, interaction.user.id, dk)
+
+        # Withdraw target address (user-provided)
+        withdraw_addr = u.get("address") or "(not set)"
+
+        # Deposit source address (linked website account)
+        deposit_addr = "(not linked)"
+        stored = u.get("website_secret")
+        if stored:
+            secret = decrypt_secret(stored)
+            if not secret:
+                deposit_addr = "(linked, but cannot decrypt)"
+            else:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        me = await api_get_me(session, secret)
+                        acct = me.get("account_id")
+                        if isinstance(acct, str) and ADDR_RE.match(acct):
+                            deposit_addr = acct.lower()
+                        else:
+                            deposit_addr = "(linked, but invalid account_id)"
+                except Exception:
+                    deposit_addr = "(linked, but cannot reach backend)"
+
         await interaction.response.send_message(
-            f"Registered HCC address: `{addr}`\n"
-            f"TipBot balance: **{u['balance']}**\n"
+            f"Withdraw address: `{withdraw_addr}`\n"
+            f"Deposit source: `{deposit_addr}`\n"
+            f"TipBot balance: **{u['balance']}** HCC\n"
             f"Withdraw today: `{wd}/{MAX_WITHDRAW_PER_DAY}`\n"
             f"Withdraw cooldown: `{WITHDRAW_COOLDOWN}s` | Min withdraw: `{MIN_WITHDRAW}`",
-            ephemeral=True
+            ephemeral=True,
         )
     finally:
         con.close()
