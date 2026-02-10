@@ -190,11 +190,41 @@ def compute_raw_power(rig: dict) -> int:
     raw += (rig_level - 1) * 10
     for asic in rig.get("asics", []):
         stars = asic.get("stars", 0)
-        raw += stars * 20 + 30
+        raw += asic_raw_for_stars(stars)
     for gpu in rig.get("gpus", []):
         stars = gpu.get("stars", 0)
-        raw += stars * 10 + 10
+        raw += gpu_raw_for_stars(stars)
     return max(1, raw)
+
+
+# --- Explicit per-device raw hashrate helpers ---
+ASIC_RAW_TABLE = {
+    0: 0,
+    1: 50,   # unchanged for existing rigs
+    2: 80,
+    3: 115,
+    4: 155,
+    5: 200,
+}
+
+def asic_raw_for_stars(stars: int) -> int:
+    """
+    Raw hashrate contribution for a single ASIC with given star level.
+    Must stay in sync with compute_raw_power().
+
+    Uses a non-linear lookup table so that higher-star ASICs scale
+    more aggressively than GPUs, while keeping 1★ behavior unchanged.
+    """
+    stars = max(0, min(5, int(stars)))
+    return ASIC_RAW_TABLE.get(stars, ASIC_RAW_TABLE[5])
+
+
+def gpu_raw_for_stars(stars: int) -> int:
+    """
+    Raw hashrate contribution for a single GPU with given star level.
+    Must stay in sync with compute_raw_power().
+    """
+    return stars * 10 + 10
 
 
 def compute_effective_power(raw_power: int) -> float:
@@ -282,7 +312,13 @@ class MinerView(View):
 
     class BuyAsicButton(Button):
         def __init__(self, row=None):
-            super().__init__(label=f"𒁈 Buy ASIC ({ASIC_COST} Ħ)", style=discord.ButtonStyle.primary, custom_id="buy_asic", row=row)
+            extra_raw = asic_raw_for_stars(1)
+            super().__init__(
+                label=f"𒁈 Buy ASIC (+{extra_raw} Gh/s, {ASIC_COST} Ħ)",
+                style=discord.ButtonStyle.primary,
+                custom_id="buy_asic",
+                row=row,
+            )
 
         async def callback(self, interaction: discord.Interaction):
             view: MinerView = self.view
@@ -314,7 +350,13 @@ class MinerView(View):
 
     class BuyGpuButton(Button):
         def __init__(self, row=None):
-            super().__init__(label=f"🎮 Buy GPU ({GPU_COST} Ħ)", style=discord.ButtonStyle.primary, custom_id="buy_gpu", row=row)
+            extra_raw = gpu_raw_for_stars(1)
+            super().__init__(
+                label=f"🎮 Buy GPU (+{extra_raw} Gh/s, {GPU_COST} Ħ)",
+                style=discord.ButtonStyle.primary,
+                custom_id="buy_gpu",
+                row=row,
+            )
 
         async def callback(self, interaction: discord.Interaction):
             view: MinerView = self.view
@@ -398,7 +440,7 @@ class MinerView(View):
     class UpgradeRigButton(Button):
         def __init__(self, current_level, upgrade_cost, row=None):
             super().__init__(
-                label=f"🏗️ Upgrade Rig (Lvl {current_level} → {current_level + 1}, {upgrade_cost} Ħ)",
+                label=f"🏗️ Upgrade Rig (Lvl {current_level} → {current_level + 1}, +10 Gh/s, {upgrade_cost} Ħ)",
                 style=discord.ButtonStyle.blurple,
                 custom_id="upgrade_rig",
                 row=row
@@ -482,7 +524,8 @@ class SelectAsicView(discord.ui.View):
             if disabled:
                 label = f"𒁈 ASIC {idx+1}: Upgrading… ({stars}⭐ → {stars+1}⭐)"
             else:
-                label = f"𒁈 Upgrade ASIC to {stars + 1}⭐ – {cost} Ħ"
+                delta_raw = asic_raw_for_stars(stars + 1) - asic_raw_for_stars(stars)
+                label = f"𒁈 Upgrade ASIC to {stars + 1}⭐ (+{delta_raw} Gh/s) – {cost} Ħ"
             style = discord.ButtonStyle.gray if disabled else (
                 discord.ButtonStyle.green if self.balance >= cost else discord.ButtonStyle.gray
             )
@@ -585,7 +628,8 @@ class SelectGpuView(discord.ui.View):
             if disabled:
                 label = f"🎮 GPU {idx+1}: Upgrading… ({stars}⭐ → {stars+1}⭐)"
             else:
-                label = f"🎮 Upgrade GPU to {stars + 1}⭐ – {cost} Ħ"
+                delta_raw = gpu_raw_for_stars(stars + 1) - gpu_raw_for_stars(stars)
+                label = f"🎮 Upgrade GPU to {stars + 1}⭐ (+{delta_raw} Gh/s) – {cost} Ħ"
             style = discord.ButtonStyle.gray if disabled else (
                 discord.ButtonStyle.green if self.balance >= cost else discord.ButtonStyle.gray
             )
@@ -864,22 +908,27 @@ class MinerGameBot:
         embed.add_field(name="Your TipBot balance", value=f"{balance} Ħ", inline=True)
 
         # --- Detailed per-device status (includes upgrade remaining time) ---
-        def _device_lines(devs, label_emoji: str) -> str:
+        def _device_lines(devs, label_emoji: str, raw_func) -> str:
             if not devs:
                 return "None"
             lines = []
             for i, d in enumerate(devs, start=1):
                 stars = int(d.get("stars", 0) or 0)
+                raw_now = raw_func(stars)
                 uet = d.get("upgrade_ready_time")
                 if uet and int(uet) > now:
                     rem = int(uet - now)
-                    lines.append(f"{label_emoji} #{i}: {stars}⭐ → {stars + 1}⭐ (ready in {fmt_duration_hms(rem)})")
+                    raw_next = raw_func(stars + 1)
+                    lines.append(
+                        f"{label_emoji} #{i}: {stars}⭐ ({raw_now} Gh/s) → {stars + 1}⭐ ({raw_next} Gh/s) "
+                        f"(ready in {fmt_duration_hms(rem)})"
+                    )
                 else:
-                    lines.append(f"{label_emoji} #{i}: {stars}⭐")
+                    lines.append(f"{label_emoji} #{i}: {stars}⭐ ({raw_now} Gh/s)")
             return "\n".join(lines)
 
-        embed.add_field(name="ASIC status", value=_device_lines(asics, "𒁈 ASIC"), inline=False)
-        embed.add_field(name="GPU status", value=_device_lines(gpus, "🎮 GPU"), inline=False)
+        embed.add_field(name="ASIC status", value=_device_lines(asics, "𒁈 ASIC", asic_raw_for_stars), inline=False)
+        embed.add_field(name="GPU status", value=_device_lines(gpus, "🎮 GPU", gpu_raw_for_stars), inline=False)
         return embed
 
     async def _run_interval_payout_once(self, now_ts: int) -> None:
