@@ -323,7 +323,7 @@ class MinerView(View):
         async def callback(self, interaction: discord.Interaction):
             view: MinerView = self.view
             if interaction.user.id != view.user_id:
-                await interaction.response.send_message("This is not your miner!", ephemeral=True)
+                await interaction.response.send_message("This is not your miner!!", ephemeral=True)
                 return
             rig = view.miner_bot.get_user_rig(view.user_id)
             max_asics = MAX_ASICS_PER_LEVEL.get(rig.get("rig_level", 1), 1)
