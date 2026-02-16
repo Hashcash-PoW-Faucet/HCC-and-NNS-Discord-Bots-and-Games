@@ -67,6 +67,12 @@ def table_exists(con: sqlite3.Connection, name: str) -> bool:
     return bool(row)
 
 
+def table_columns(con: sqlite3.Connection, name: str) -> List[str]:
+    rows = fetch_all(con, f"PRAGMA table_info({name})")
+    # PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
+    return [r[1] for r in rows]
+
+
 def dump_users(con: sqlite3.Connection, limit: Optional[int]) -> None:
     if not table_exists(con, "users"):
         print("Table 'users' not found.")
@@ -172,6 +178,49 @@ def dump_tx_log(con: sqlite3.Connection, limit: int, only_type: Optional[str], o
     )
 
 
+def dump_swap_log(con: sqlite3.Connection, limit: int, only_status: Optional[str]) -> None:
+    if not table_exists(con, "swap_log"):
+        print("Table 'swap_log' not found.")
+        return
+
+    cols = table_columns(con, "swap_log")
+    # Choose a reasonable ordering column
+    order_col = "id" if "id" in cols else ("ts" if "ts" in cols else cols[0])
+
+    where = []
+    params: List[Any] = []
+    if only_status and "status" in cols:
+        where.append("status = ?")
+        params.append(only_status)
+    wsql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    q = f"SELECT {', '.join(cols)} FROM swap_log {wsql} ORDER BY {order_col} DESC LIMIT ?"
+    params.append(limit)
+    rows = fetch_all(con, q, tuple(params))
+
+    pretty_rows: List[Tuple[Any, ...]] = []
+    for r in rows:
+        # r is a tuple; map special formatting for timestamps and long text
+        out: List[Any] = []
+        for i, v in enumerate(r):
+            cname = cols[i]
+            if cname in ("ts", "created_at", "updated_at", "first_seen_ts", "last_update_ts"):
+                out.append(fmt_ts(v))
+            elif cname in ("note", "error"):
+                out.append(shorten(v, 60))
+            elif isinstance(v, str):
+                out.append(shorten(v, 60))
+            else:
+                out.append(v)
+        pretty_rows.append(tuple(out))
+
+    print_table(
+        f"SWAP_LOG (last {limit})",
+        cols,
+        pretty_rows,
+    )
+
+
 def dump_schema(con: sqlite3.Connection) -> None:
     rows = fetch_all(
         con,
@@ -189,19 +238,22 @@ def main() -> None:
     ap.add_argument("--users", action="store_true", help="Dump users table")
     ap.add_argument("--limits", action="store_true", help="Dump daily_limits table")
     ap.add_argument("--tx", action="store_true", help="Dump tx_log table")
+    ap.add_argument("--swaps", action="store_true", help="Dump swap_log table (recent swaps)")
     ap.add_argument("--schema", action="store_true", help="Dump DB schema")
     ap.add_argument("--limit", type=int, default=50, help="Limit rows (default: 50). For --tx this is last N entries.")
     ap.add_argument("--tx-type", default="", help="Filter tx_log by type (tip|grant|withdraw)")
     ap.add_argument("--tx-status", default="", help="Filter tx_log by status (ok|pending|failed)")
+    ap.add_argument("--swap-status", default="", help="Filter swap_log by status if column exists")
 
     args = ap.parse_args()
 
     # If no section chosen, dump everything
-    if not (args.users or args.limits or args.tx or args.schema):
+    if not (args.users or args.limits or args.tx or args.swaps or args.schema):
         args.schema = True
         args.users = True
         args.limits = True
         args.tx = True
+        args.swaps = True
 
     con = sqlite3.connect(args.db)
     try:
@@ -218,6 +270,12 @@ def main() -> None:
                 limit=max(1, args.limit),
                 only_type=args.tx_type.strip() or None,
                 only_status=args.tx_status.strip() or None,
+            )
+        if args.swaps:
+            dump_swap_log(
+                con,
+                limit=max(1, args.limit),
+                only_status=args.swap_status.strip() or None,
             )
     finally:
         con.close()
