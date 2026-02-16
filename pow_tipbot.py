@@ -3,7 +3,10 @@ import re
 import json
 import time
 import sqlite3
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple, List
+
+from decimal import Decimal, ROUND_DOWN
+from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
@@ -21,6 +24,29 @@ except Exception:
 
 load_dotenv()
 
+
+# ---------------------------
+# Constants
+# ---------------------------
+VECO_SATS = 100_000_000  # 1 VECO = 1e8 sats
+
+
+# --- VECO helpers (integer-only: sats) ---
+def format_sat_to_veco(sat: int) -> str:
+    return f"{(Decimal(int(sat)) / VECO_SATS):.8f}"
+
+
+def parse_veco_to_sat(s: str) -> int:
+    s = (s or "").strip()
+    if not s:
+        raise ValueError("missing amount")
+    d = Decimal(s).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+    sat = int(d * VECO_SATS)
+    if sat <= 0:
+        raise ValueError("amount must be > 0")
+    return sat
+
+
 # ---------------------------
 # Config
 # ---------------------------
@@ -31,7 +57,18 @@ TIPBOT_TREASURY_SECRET = os.environ.get("TIPBOT_TREASURY_SECRET", "").strip()
 
 DB_PATH = os.environ.get("TIPBOT_DB", "tipbot.db").strip()
 
-# Withdraw policy (your requested values)
+# VECO RPC (node wallet)
+VECO_RPC_URL = os.environ.get("VECO_RPC_URL", "http://127.0.0.1:26920/").strip()
+VECO_RPC_USER = os.environ.get("VECO_RPC_USER", "").strip()
+VECO_RPC_PASSWORD = os.environ.get("VECO_RPC_PASSWORD", "").strip()
+VECO_DEPOSIT_CONFS = int(os.environ.get("VECO_DEPOSIT_CONFS", "6"))
+VECO_MIN_WITHDRAW_SAT = parse_veco_to_sat(os.environ.get("VECO_MIN_WITHDRAW", "0.10000"))
+
+# VECO withdraw fee (paid to admin address). Fee is taken from the requested amount.
+VECO_WITHDRAW_FEE_BPS = int(os.environ.get("VECO_WITHDRAW_FEE_BPS", "100"))  # 1.00%
+VECO_WITHDRAW_FEE_ADDRESS = os.environ.get("VECO_WITHDRAW_FEE_ADDRESS", "").strip()
+
+# Withdraw policy
 MIN_WITHDRAW = int(os.environ.get("MIN_WITHDRAW", "1"))
 WITHDRAW_COOLDOWN = int(os.environ.get("WITHDRAW_COOLDOWN", "60"))  # seconds
 MAX_WITHDRAW_PER_DAY = int(os.environ.get("MAX_WITHDRAW_PER_DAY", "200"))
@@ -51,6 +88,15 @@ ADDR_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 # Recommended: set TIPBOT_FERNET_KEY (Fernet key). If not set, secrets are stored plaintext.
 TIPBOT_FERNET_KEY = os.environ.get("TIPBOT_FERNET_KEY", "").strip()
 
+# ---------------------------
+# AMM Swap (HCC <-> VECO)
+# ---------------------------
+DEFAULT_POOL_HCC = int(os.environ.get("AMM_INIT_HCC", "40000"))
+DEFAULT_POOL_VECO = int(os.environ.get("AMM_INIT_VECO", "20000"))  # VECO (human)
+DEFAULT_POOL_FEE_BPS = int(os.environ.get("AMM_FEE_BPS", "75"))    # 0.75%
+DEFAULT_SLIPPAGE_BPS = int(os.environ.get("AMM_DEFAULT_SLIPPAGE_BPS", "100"))  # 1.00%
+QUOTE_TTL_SECONDS = int(os.environ.get("AMM_QUOTE_TTL", "30"))
+
 
 # ---------------------------
 # Helpers
@@ -69,6 +115,104 @@ def normalize_addr(addr: str) -> str:
     if not ADDR_RE.match(addr):
         raise ValueError("bad address format")
     return addr.lower()
+
+
+@dataclass(frozen=True)
+class AmmQuote:
+    amount_out: int
+    fee_amount: int
+    price_impact_bps: int
+
+
+def quote_hcc_to_veco(amount_in_hcc: int, R_hcc: int, R_veco_sat: int, fee_bps: int) -> AmmQuote:
+    if amount_in_hcc <= 0:
+        raise ValueError("amount must be > 0")
+    if R_hcc <= 0 or R_veco_sat <= 0:
+        raise ValueError("pool reserves must be > 0")
+
+    fee = (amount_in_hcc * fee_bps) // 10_000
+    dx = amount_in_hcc - fee
+    if dx <= 0:
+        raise ValueError("amount too small after fee")
+
+    k = R_hcc * R_veco_sat
+    new_R_hcc = R_hcc + dx
+    new_R_veco = k // new_R_hcc
+    out = R_veco_sat - new_R_veco
+    if out <= 0:
+        raise ValueError("insufficient liquidity")
+
+    # price impact (bps)
+    p0 = (R_veco_sat * 1_000_000) // R_hcc
+    pe = (out * 1_000_000) // max(1, amount_in_hcc)
+    impact_bps = 0
+    if p0 > 0 and pe < p0:
+        impact_bps = ((p0 - pe) * 10_000) // p0
+
+    return AmmQuote(amount_out=out, fee_amount=fee, price_impact_bps=int(impact_bps))
+
+
+def quote_veco_to_hcc(amount_in_sat: int, R_hcc: int, R_veco_sat: int, fee_bps: int) -> AmmQuote:
+    if amount_in_sat <= 0:
+        raise ValueError("amount must be > 0")
+    if R_hcc <= 0 or R_veco_sat <= 0:
+        raise ValueError("pool reserves must be > 0")
+
+    fee = (amount_in_sat * fee_bps) // 10_000
+    dx = amount_in_sat - fee
+    if dx <= 0:
+        raise ValueError("amount too small after fee")
+
+    k = R_hcc * R_veco_sat
+    new_R_veco = R_veco_sat + dx
+    new_R_hcc = k // new_R_veco
+    out = R_hcc - new_R_hcc
+    if out <= 0:
+        raise ValueError("insufficient liquidity")
+
+    p0 = (R_hcc * 1_000_000) // R_veco_sat
+    pe = (out * 1_000_000) // max(1, amount_in_sat)
+    impact_bps = 0
+    if p0 > 0 and pe < p0:
+        impact_bps = ((p0 - pe) * 10_000) // p0
+
+    return AmmQuote(amount_out=out, fee_amount=fee, price_impact_bps=int(impact_bps))
+
+
+def apply_slippage_min_out(amount_out: int, slippage_bps: int) -> int:
+    slippage_bps = int(slippage_bps)
+    if slippage_bps < 0 or slippage_bps > 5_000:
+        raise ValueError("slippage out of range")
+    return (int(amount_out) * (10_000 - slippage_bps)) // 10_000
+
+
+# --- Slippage percent helper ---
+def percent_to_bps(pct_str: str) -> int:
+    """Convert a user-facing percent string (e.g. '1', '0.5') to bps (1% = 100 bps)."""
+    s = (pct_str or "").strip().replace("%", "")
+    if not s:
+        raise ValueError("missing slippage")
+    d = Decimal(s)
+    if d < 0:
+        raise ValueError("slippage must be >= 0")
+    # clamp to 50% max to avoid extreme values
+    if d > Decimal("50"):
+        raise ValueError("slippage too large")
+    # 1% = 100 bps
+    bps = int((d * Decimal("100")).to_integral_value(rounding=ROUND_DOWN))
+    return int(bps)
+
+
+# --- VECO withdrawal fee helper ---
+def compute_withdraw_fee_sat(amount_sat: int) -> int:
+    """Compute withdrawal fee in sats (taken from amount)."""
+    bps = int(VECO_WITHDRAW_FEE_BPS)
+    if bps <= 0:
+        return 0
+    fee = (int(amount_sat) * bps) // 10_000
+    if fee <= 0 and int(amount_sat) > 0:
+        fee = 1
+    return int(fee)
 
 
 # --- Private key encryption helpers ---
@@ -128,6 +272,8 @@ def init_db() -> None:
       address TEXT,
       website_secret TEXT,
       balance INTEGER NOT NULL DEFAULT 0,
+      veco_internal_sat INTEGER NOT NULL DEFAULT 0,
+      veco_deposit_address TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       last_withdraw_at INTEGER NOT NULL DEFAULT 0
@@ -136,6 +282,15 @@ def init_db() -> None:
     # Backward-compatible migration (older DBs): add website_secret column if missing.
     try:
         con.execute("ALTER TABLE users ADD COLUMN website_secret TEXT;")
+    except Exception:
+        pass
+    # Backward-compatible migration: add VECO columns if missing.
+    try:
+        con.execute("ALTER TABLE users ADD COLUMN veco_internal_sat INTEGER NOT NULL DEFAULT 0;")
+    except Exception:
+        pass
+    try:
+        con.execute("ALTER TABLE users ADD COLUMN veco_deposit_address TEXT;")
     except Exception:
         pass
     con.execute("""
@@ -160,12 +315,76 @@ def init_db() -> None:
       error TEXT
     );
     """)
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS amm_pool (
+      id INTEGER PRIMARY KEY CHECK(id=1),
+      hcc_reserve INTEGER NOT NULL,
+      veco_reserve_sat INTEGER NOT NULL,
+      fee_bps INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    """)
+
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS swap_quotes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      discord_id INTEGER NOT NULL,
+      from_asset TEXT NOT NULL,
+      to_asset TEXT NOT NULL,
+      amount_in INTEGER NOT NULL,
+      amount_out INTEGER NOT NULL,
+      min_out INTEGER NOT NULL,
+      fee_amount INTEGER NOT NULL,
+      price_impact_bps INTEGER NOT NULL
+    );
+    """)
+
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS swap_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      discord_id INTEGER NOT NULL,
+      from_asset TEXT NOT NULL,
+      to_asset TEXT NOT NULL,
+      amount_in INTEGER NOT NULL,
+      amount_out INTEGER NOT NULL,
+      fee_amount INTEGER NOT NULL,
+      price_impact_bps INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      error TEXT
+    );
+    """)
+
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS veco_withdrawals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      discord_id INTEGER NOT NULL,
+      to_address TEXT NOT NULL,
+      amount_sat INTEGER NOT NULL,
+      fee_sat INTEGER NOT NULL DEFAULT 0,
+      txid TEXT,
+      status TEXT NOT NULL,   -- pending | sent | failed
+      error TEXT
+    );
+    """)
+
+    # Ensure there is exactly one pool row (id=1). Defaults can be overridden via env.
+    row = con.execute("SELECT id FROM amm_pool WHERE id=1").fetchone()
+    if not row:
+        ts = now_ts()
+        con.execute(
+            "INSERT INTO amm_pool(id, hcc_reserve, veco_reserve_sat, fee_bps, updated_at) VALUES(1,?,?,?,?)",
+            (int(DEFAULT_POOL_HCC), int(DEFAULT_POOL_VECO) * VECO_SATS, int(DEFAULT_POOL_FEE_BPS), ts)
+        )
     con.close()
 
 
 def get_or_create_user(con: sqlite3.Connection, discord_id: int) -> Dict[str, Any]:
     row = con.execute(
-        "SELECT discord_id, address, website_secret, balance, created_at, updated_at, last_withdraw_at FROM users WHERE discord_id=?",
+        "SELECT discord_id, address, website_secret, balance, veco_internal_sat, veco_deposit_address, created_at, updated_at, last_withdraw_at FROM users WHERE discord_id=?",
         (discord_id,)
     ).fetchone()
     if row:
@@ -174,20 +393,24 @@ def get_or_create_user(con: sqlite3.Connection, discord_id: int) -> Dict[str, An
             "address": row[1],
             "website_secret": row[2],
             "balance": int(row[3]),
-            "created_at": int(row[4]),
-            "updated_at": int(row[5]),
-            "last_withdraw_at": int(row[6]),
+            "veco_internal_sat": int(row[4]),
+            "veco_deposit_address": row[5],
+            "created_at": int(row[6]),
+            "updated_at": int(row[7]),
+            "last_withdraw_at": int(row[8]),
         }
     ts = now_ts()
     con.execute(
-        "INSERT INTO users(discord_id, address, website_secret, balance, created_at, updated_at, last_withdraw_at) VALUES(?,?,?,?,?,?,0)",
-        (discord_id, None, None, 0, ts, ts)
+        "INSERT INTO users(discord_id, address, website_secret, balance, veco_internal_sat, veco_deposit_address, created_at, updated_at, last_withdraw_at) VALUES(?,?,?,?,?,?,?, ?, 0)",
+        (discord_id, None, None, 0, 0, None, ts, ts)
     )
     return {
         "discord_id": discord_id,
         "address": None,
         "website_secret": None,
         "balance": 0,
+        "veco_internal_sat": 0,
+        "veco_deposit_address": None,
         "created_at": ts,
         "updated_at": ts,
         "last_withdraw_at": 0,
@@ -222,6 +445,65 @@ def has_pending_withdraw(con: sqlite3.Connection, discord_id: int) -> bool:
     ).fetchone()
     return bool(row)
 
+def has_pending_veco_withdraw(con: sqlite3.Connection, discord_id: int) -> bool:
+    row = con.execute(
+        "SELECT id FROM veco_withdrawals WHERE discord_id=? AND status='pending' ORDER BY id DESC LIMIT 1",
+        (discord_id,)
+    ).fetchone()
+    return bool(row)
+
+# ---------------------------
+# AMM pool helpers
+# ---------------------------
+
+def get_pool(con: sqlite3.Connection) -> Dict[str, int]:
+    row = con.execute("SELECT hcc_reserve, veco_reserve_sat, fee_bps, updated_at FROM amm_pool WHERE id=1").fetchone()
+    if not row:
+        raise RuntimeError("AMM pool not initialized")
+    return {
+        "hcc_reserve": int(row[0]),
+        "veco_reserve_sat": int(row[1]),
+        "fee_bps": int(row[2]),
+        "updated_at": int(row[3]),
+    }
+
+
+def set_pool(con: sqlite3.Connection, hcc_reserve: int, veco_reserve_sat: int, fee_bps: int) -> None:
+    con.execute(
+        "UPDATE amm_pool SET hcc_reserve=?, veco_reserve_sat=?, fee_bps=?, updated_at=? WHERE id=1",
+        (int(hcc_reserve), int(veco_reserve_sat), int(fee_bps), now_ts())
+    )
+
+
+#
+# ---------------------------
+# VECO RPC helper (wallet-based)
+# ---------------------------
+async def veco_rpc_call(method: str, params: Optional[List[Any]] = None) -> Any:
+    """Call VECO JSON-RPC. Requires VECO_RPC_URL/USER/PASSWORD."""
+    if not VECO_RPC_URL or not VECO_RPC_USER or not VECO_RPC_PASSWORD:
+        raise RuntimeError("VECO RPC not configured (set VECO_RPC_URL/USER/PASSWORD)")
+
+    payload = {
+        "jsonrpc": "1.0",
+        "id": "tipbot",
+        "method": method,
+        "params": params or [],
+    }
+
+    auth = aiohttp.BasicAuth(VECO_RPC_USER, VECO_RPC_PASSWORD)
+    async with aiohttp.ClientSession(auth=auth) as session:
+        async with session.post(VECO_RPC_URL, json=payload, timeout=30) as r:
+            txt = await r.text()
+            if r.status != 200:
+                raise RuntimeError(f"VECO RPC HTTP {r.status}: {txt}")
+            try:
+                data = json.loads(txt)
+            except Exception:
+                raise RuntimeError(f"VECO RPC invalid JSON: {txt}")
+            if data.get("error"):
+                raise RuntimeError(f"VECO RPC error: {data['error']}")
+            return data.get("result")
 
 # ---------------------------
 # Hashcash backend API calls (matches your FastAPI app.py)
@@ -294,6 +576,8 @@ class TipBot(discord.Client):
 
 
 bot = TipBot()
+# In-memory ephemeral swap sessions (per user). Safe to lose on restart.
+SWAP_SESSIONS: Dict[int, Dict[str, Any]] = {}
 
 
 def is_admin(interaction: discord.Interaction) -> bool:
@@ -310,32 +594,48 @@ def is_admin(interaction: discord.Interaction) -> bool:
 @bot.tree.command(name="help", description="Show tip bot commands.")
 async def help_cmd(interaction: discord.Interaction):
     text = (
-        "**HCC TipBot**\n"
-        "• `/register_address <address>` – Register HCC address for withdrawals (for deposits use /link_account)\n"
-        "• `/balance` – Show your discord account's internal HCC balance.\n"
-        "• `/link_account` – Link with a Hashcash account for deposits (requires private key). \n"
-        "• `/unlink_account` – Remove your deposit account.\n"
-        "• `/deposit <amount|max>` – Move HCC from your website account into your Discord balance.\n"
-        "• `/tip @user <amount> [note]` – Tip HCC to another user.\n"
-        "• `/withdraw <amount>` – Withdraw HCC from your discord account to your registered withdrawal address.\n\n"
-        f"Withdraw policy:\n"
-        f"• Min: `{MIN_WITHDRAW}`\n"
-        f"• Cooldown: `{WITHDRAW_COOLDOWN}s`\n"
-        f"• Max per day: `{MAX_WITHDRAW_PER_DAY}`\n\n"
+        "**HCC TipBot (HCC + VECO + Swap)**\n"
+        "\n"
+        "**HCC (website ↔ Discord internal)**\n"
+        "• `/hcc_link_account` – Link your Hashcash website account\n"
+        "• `/hcc_unlink_account` – Unlink your website account\n"
+        "• `/hcc_deposit <amount|max>` – Move HCC from your website account into your Discord balance\n"
+        "\n"
+        "**HCC (internal ↔ address)**\n"
+        "• `/hcc_register_address <address>` – Set your HCC withdrawal address (40 hex)\n"
+        "• `/tip @user <amount> [note]` – Tip HCC to another user (internal)\n"
+        "• `/hcc_withdraw <amount>` – Withdraw HCC to your registered address (via treasury)\n"
+        "• `/whoami` – Show your registered addresses and limits\n"
+        "\n"
+        "**VECO (on-chain ↔ Discord internal)**\n"
+        f"• `/veco_deposit` – Show (or create) your personal VECO deposit address (credits after {VECO_DEPOSIT_CONFS} confs)\n"
+        "• `/balances` – Show your internal HCC + internal VECO balances\n"
+        "• `/veco_withdraw <to_address> <amount>` – Request a VECO on-chain withdrawal from your internal balance\n"
+        "• `/veco_withdraw_status <id>` – Check status / txid of a VECO withdrawal\n"
+        "\n"
+        "**Swap (internal AMM: HCC ⇄ VECO)**\n"
+        "• `/ui_swap` – Open the swap UI (ephemeral)\n"
+        "• `/swap <from_asset> <amount> [slippage_pct]` – Swap via command (no UI)\n"
+        "\n"
+        "**Limits / Policies**\n"
+        f"• HCC min withdraw: `{MIN_WITHDRAW}` | cooldown: `{WITHDRAW_COOLDOWN}s` | max/day: `{MAX_WITHDRAW_PER_DAY}`\n"
+        f"• VECO min withdraw (after fee): `{format_sat_to_veco(VECO_MIN_WITHDRAW_SAT)}` VECO\n"
+        f"• VECO withdrawal fee: `{VECO_WITHDRAW_FEE_BPS/100:.2f}%` (taken from amount; paid to operator)\n"
+        "\n"
         "Notes:\n"
-        "• This bot uses an internal ledger. You can optionally link your Hashcash website account and deposit into Discord.\n"
-        "  Use `/link_account` + `/deposit` to top up your Discord balance.\n"
-        "• If your HCC address does not exist yet, withdraw will fail (unknown recipient).\n"
+        "• HCC uses an internal ledger; `/hcc_deposit` moves credits from your website account into Discord.\n"
+        "• VECO deposits are real on-chain transfers to your personal deposit address.\n"
+        "• Safety: withdrawing VECO to any bot-managed deposit address is blocked.\n"
     )
     await interaction.response.send_message(text, ephemeral=True)
 
 
 @bot.tree.command(
-    name="register_address",
+    name="hcc_register_address",
     description="Register your HCC address (40 hex). No existence check."
 )
 @app_commands.describe(address="Your HCC address (40 hex characters)")
-async def register_address(interaction: discord.Interaction, address: str):
+async def hcc_register_address(interaction: discord.Interaction, address: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     try:
@@ -374,11 +674,12 @@ async def register_address(interaction: discord.Interaction, address: str):
         con.close()
 
     await interaction.followup.send(
-        f"Registered ✅\nStored address: `{addr}`\nYou can withdraw with `/withdraw <amount>`.",
+        f"Registered ✅\nStored address: `{addr}`\nYou can withdraw with `/hcc_withdraw <amount>`.",
         ephemeral=True
     )
 
 
+"""
 @bot.tree.command(name="balance", description="Show your TipBot balance.")
 async def balance(interaction: discord.Interaction):
     con = db()
@@ -391,6 +692,7 @@ async def balance(interaction: discord.Interaction):
         )
     finally:
         con.close()
+"""
 
 
 # ---------------------------
@@ -464,18 +766,18 @@ class LinkAccountModal(discord.ui.Modal, title="Link Website Account"):
         key_hint = "" if enc_note == "encrypted" else " (Tip: set TIPBOT_FERNET_KEY to encrypt secrets at rest.)"
 
         await interaction.response.send_message(
-            f"Linked ✅ Website Hashcash account: `{acct.lower()}`\nYou can now use `/deposit`.",
+            f"Linked ✅ Website Hashcash account: `{acct.lower()}`\nYou can now use `/hcc_deposit`.",
             ephemeral=True,
         )
 
 
-@bot.tree.command(name="link_account", description="Link your website account for direct deposits (note: private key is stored encrypted).")
-async def link_account(interaction: discord.Interaction):
+@bot.tree.command(name="hcc_link_account", description="Link your HCC website account for direct deposits (note: private key is stored encrypted).")
+async def hcc_link_account(interaction: discord.Interaction):
     await interaction.response.send_modal(LinkAccountModal(interaction.user.id))
 
 
-@bot.tree.command(name="unlink_account", description="Remove your website account secret.")
-async def unlink_account(interaction: discord.Interaction):
+@bot.tree.command(name="hcc_unlink_account", description="Remove your HCC website account secret.")
+async def hcc_unlink_account(interaction: discord.Interaction):
     con = db()
     try:
         con.execute("BEGIN IMMEDIATE;")
@@ -494,9 +796,9 @@ async def unlink_account(interaction: discord.Interaction):
     await interaction.response.send_message("Unlinked ✅ Your website account was unlinked.", ephemeral=True)
 
 
-@bot.tree.command(name="deposit", description="Deposit HCC from your website account into your Discord balance.")
+@bot.tree.command(name="hcc_deposit", description="Deposit HCC from your website account into your Discord balance.")
 @app_commands.describe(amount="Amount to deposit (integer) or 'max'")
-async def deposit(interaction: discord.Interaction, amount: str):
+async def hcc_deposit(interaction: discord.Interaction, amount: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     if not bot.treasury_address:
@@ -517,7 +819,7 @@ async def deposit(interaction: discord.Interaction, amount: str):
     secret = decrypt_secret(stored)
     if not secret:
         await interaction.followup.send(
-            "No Hashcash website account linked. Use `/link_account` first (ephemeral).",
+            "No Hashcash website account linked. Use `/hcc_link_account` first (ephemeral).",
             ephemeral=True,
         )
         return
@@ -602,7 +904,7 @@ async def deposit(interaction: discord.Interaction, amount: str):
     await interaction.followup.send(
         f"Deposit successful ✅\nMoved **{dep_amount} HCC** from your website account into your Discord balance.\n"
         f"Your TipBot balance: **{new_bal} HCC**\n\n"
-        "To cash out to your HCC address: use `/withdraw` in the TipBot.",
+        "To cash out to your HCC address: use `/hcc_withdraw` in the TipBot.",
         ephemeral=True,
     )
 
@@ -672,9 +974,9 @@ async def tip(interaction: discord.Interaction, user: discord.User, amount: int,
     )
 
 
-@bot.tree.command(name="withdraw", description="Withdraw to your registered HCC address (via bot treasury).")
+@bot.tree.command(name="hcc_withdraw", description="Withdraw to your registered HCC address (via bot treasury).")
 @app_commands.describe(amount="Amount to withdraw")
-async def withdraw(interaction: discord.Interaction, amount: int):
+async def hcc_withdraw(interaction: discord.Interaction, amount: int):
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     if amount < MIN_WITHDRAW:
@@ -704,7 +1006,7 @@ async def withdraw(interaction: discord.Interaction, amount: int):
 
         if not to_addr:
             con.execute("ROLLBACK;")
-            await interaction.followup.send("No HCC address registered. Use `/register_address` first.", ephemeral=True)
+            await interaction.followup.send("No HCC address registered. Use `/hcc_register_address` first.", ephemeral=True)
             return
 
         # basic sanity
@@ -855,7 +1157,7 @@ async def withdraw(interaction: discord.Interaction, amount: int):
     )
 
 
-@bot.tree.command(name="whoami", description="Show your registered HCC address and basic limits.")
+@bot.tree.command(name="whoami", description="Show your registered HCC / VECO addresses and basic info.")
 async def whoami(interaction: discord.Interaction):
     con = db()
     try:
@@ -886,11 +1188,12 @@ async def whoami(interaction: discord.Interaction):
                     deposit_addr = "(linked, but cannot reach backend)"
 
         await interaction.response.send_message(
-            f"Withdraw address: `{withdraw_addr}`\n"
-            f"Deposit source: `{deposit_addr}`\n"
-            f"TipBot balance: **{u['balance']}** HCC\n"
-            f"Withdraw today: `{wd}/{MAX_WITHDRAW_PER_DAY}`\n"
-            f"Withdraw cooldown: `{WITHDRAW_COOLDOWN}s` | Min withdraw: `{MIN_WITHDRAW}`",
+            f"HCC withdraw address: `{withdraw_addr}`\n"
+            f"HCC website source: `{deposit_addr}`\n"
+            f"VECO deposit address: `{(u.get('veco_deposit_address') or '(not created)')}`\n"
+            f"Balances: **{u['balance']} HCC** | **{format_sat_to_veco(int(u.get('veco_internal_sat') or 0))} VECO**\n"
+            f"HCC withdraw today: `{wd}/{MAX_WITHDRAW_PER_DAY}`\n"
+            f"HCC cooldown: `{WITHDRAW_COOLDOWN}s` | HCC min withdraw: `{MIN_WITHDRAW}`\n",
             ephemeral=True,
         )
     finally:
@@ -900,6 +1203,69 @@ async def whoami(interaction: discord.Interaction):
 # ---------------------------
 # Admin commands
 # ---------------------------
+@bot.tree.command(name="pool_status", description="(Admin) Show AMM pool reserves and fee.")
+async def pool_status(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    if not is_admin(interaction):
+        await interaction.followup.send("Admin only.", ephemeral=True)
+        return
+    con = db()
+    try:
+        p = get_pool(con)
+        await interaction.followup.send(
+            f"AMM Pool (x*y=k)\n"
+            f"• HCC reserve: **{p['hcc_reserve']}**\n"
+            f"• VECO reserve: **{format_sat_to_veco(p['veco_reserve_sat'])}** VECO\n"
+            f"• Fee: **{p['fee_bps']/100:.2f}%** ({p['fee_bps']} bps)",
+            ephemeral=True,
+        )
+    finally:
+        con.close()
+
+
+@bot.tree.command(name="pool_init", description="(Admin) Initialize/reset AMM pool reserves.")
+@app_commands.describe(hcc_reserve="HCC reserve (integer)", veco_reserve="VECO reserve (decimal allowed)", fee_bps="Fee in bps (e.g., 75 = 0.75%)")
+async def pool_init(interaction: discord.Interaction, hcc_reserve: int = DEFAULT_POOL_HCC, veco_reserve: str = str(DEFAULT_POOL_VECO), fee_bps: int = DEFAULT_POOL_FEE_BPS):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    if not is_admin(interaction):
+        await interaction.followup.send("Admin only.", ephemeral=True)
+        return
+    if hcc_reserve <= 0:
+        await interaction.followup.send("hcc_reserve must be > 0", ephemeral=True)
+        return
+    try:
+        veco_sat = parse_veco_to_sat(veco_reserve)
+    except Exception as e:
+        await interaction.followup.send(f"Invalid VECO amount: `{e}`", ephemeral=True)
+        return
+    if veco_sat <= 0:
+        await interaction.followup.send("veco_reserve must be > 0", ephemeral=True)
+        return
+    if fee_bps < 0 or fee_bps > 1_000:
+        await interaction.followup.send("fee_bps out of range (0..1000)", ephemeral=True)
+        return
+
+    con = db()
+    try:
+        con.execute("BEGIN IMMEDIATE;")
+        set_pool(con, hcc_reserve, veco_sat, fee_bps)
+        con.execute("COMMIT;")
+    except Exception:
+        try:
+            con.execute("ROLLBACK;")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+    await interaction.followup.send(
+        f"Pool updated ✅\n"
+        f"• HCC reserve: **{hcc_reserve}**\n"
+        f"• VECO reserve: **{format_sat_to_veco(veco_sat)}**\n"
+        f"• Fee: **{fee_bps/100:.2f}%** ({fee_bps} bps)",
+        ephemeral=True,
+    )
 @bot.tree.command(name="grant", description="(Admin) Grant internal HCC to a user.")
 @app_commands.describe(user="Recipient", amount="Amount to grant", note="Optional note")
 async def grant(interaction: discord.Interaction, user: discord.User, amount: int, note: Optional[str] = None):
@@ -934,6 +1300,907 @@ async def grant(interaction: discord.Interaction, user: discord.User, amount: in
         con.close()
 
     await interaction.followup.send(f"Granted ✅ {user.mention} received **{amount}** HCC.", ephemeral=True)
+
+
+# ---------------------------
+# AMM user commands
+# ---------------------------
+
+@bot.tree.command(name="balances", description="Show your HCC and internal VECO balances.")
+async def balances(interaction: discord.Interaction):
+    con = db()
+    try:
+        u = get_or_create_user(con, interaction.user.id)
+        hcc = int(u.get("balance") or 0)
+        vs = int(u.get("veco_internal_sat") or 0)
+        await interaction.response.send_message(
+            f"HCC (internal): **{hcc}**\nVECO (internal): **{format_sat_to_veco(vs)}**",
+            ephemeral=True,
+        )
+    finally:
+        con.close()
+
+
+# ---------------------------
+# VECO deposit/withdraw commands
+# ---------------------------
+
+@bot.tree.command(name="veco_deposit", description="Show (or create) your personal VECO deposit address.")
+async def veco_deposit(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    con = db()
+    try:
+        u = get_or_create_user(con, interaction.user.id)
+        addr = (u.get("veco_deposit_address") or "").strip()
+    finally:
+        con.close()
+
+    if addr:
+        await interaction.followup.send(
+            f"Your VECO deposit address:\n`{addr}`\n\n"
+            f"Credits are added to your internal VECO balance after **{VECO_DEPOSIT_CONFS} confirmations**.",
+            ephemeral=True,
+        )
+        return
+
+    # Create a new address in the VECO wallet
+    try:
+        label = f"discord:{interaction.user.id}"
+        new_addr = await veco_rpc_call("getnewaddress", [label])
+        if not isinstance(new_addr, str) or not new_addr.strip():
+            raise RuntimeError("getnewaddress returned an invalid address")
+        new_addr = new_addr.strip()
+    except Exception as e:
+        await interaction.followup.send(f"Could not create VECO deposit address ❌ `{e}`", ephemeral=True)
+        return
+
+    # Persist in DB
+    con2 = db()
+    try:
+        con2.execute("BEGIN IMMEDIATE;")
+        get_or_create_user(con2, interaction.user.id)
+        con2.execute(
+            "UPDATE users SET veco_deposit_address=?, updated_at=? WHERE discord_id=?",
+            (new_addr, now_ts(), interaction.user.id),
+        )
+        con2.execute("COMMIT;")
+    except Exception:
+        try:
+            con2.execute("ROLLBACK;")
+        except Exception:
+            pass
+        raise
+    finally:
+        con2.close()
+
+    await interaction.followup.send(
+        f"Created your VECO deposit address ✅\n`{new_addr}`\n\n"
+        f"Credits are added to your internal VECO balance after **{VECO_DEPOSIT_CONFS} confirmations**.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="veco_withdraw", description="Request an on-chain VECO withdrawal from your internal balance.")
+@app_commands.describe(to_address="Destination VECO address", amount="Amount (VECO, up to 8 decimals)")
+async def veco_withdraw(interaction: discord.Interaction, to_address: str, amount: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    to_address = (to_address or "").strip()
+    if not to_address or len(to_address) < 20:
+        await interaction.followup.send("Invalid VECO address.", ephemeral=True)
+        return
+
+    # Safety: prevent circular withdrawals to any known deposit address (would just loop back via watcher)
+    con_chk = db()
+    try:
+        row = con_chk.execute(
+            "SELECT discord_id FROM users WHERE veco_deposit_address IS NOT NULL AND TRIM(veco_deposit_address)=? LIMIT 1",
+            (to_address,),
+        ).fetchone()
+    finally:
+        try:
+            con_chk.close()
+        except Exception:
+            pass
+
+    if row is not None:
+        await interaction.followup.send(
+            "Safety check: you cannot withdraw to a bot-managed VECO deposit address (this would create a deposit/withdraw loop). "
+            "Please withdraw to an external VECO address you control.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        amt_sat = parse_veco_to_sat(amount)
+    except Exception as e:
+        await interaction.followup.send(f"Invalid amount: `{e}`", ephemeral=True)
+        return
+
+    fee_sat = 0
+    if int(VECO_WITHDRAW_FEE_BPS) > 0:
+        if not VECO_WITHDRAW_FEE_ADDRESS:
+            await interaction.followup.send(
+                "Bot misconfigured: VECO withdrawal fee is enabled but VECO_WITHDRAW_FEE_ADDRESS is not set.",
+                ephemeral=True,
+            )
+            return
+        fee_sat = compute_withdraw_fee_sat(amt_sat)
+
+    net_sat = int(amt_sat) - int(fee_sat)
+    if net_sat <= 0:
+        await interaction.followup.send(
+            "Amount too small after fee. Please enter a larger withdrawal amount.",
+            ephemeral=True,
+        )
+        return
+
+    if net_sat < int(VECO_MIN_WITHDRAW_SAT):
+        await interaction.followup.send(
+            f"Minimum VECO withdraw (after fee) is **{format_sat_to_veco(VECO_MIN_WITHDRAW_SAT)}** VECO.",
+            ephemeral=True,
+        )
+        return
+
+    # Reserve internal balance + create pending withdrawal
+    con = db()
+    try:
+        con.execute("BEGIN IMMEDIATE;")
+        u = get_or_create_user(con, interaction.user.id)
+        bal_sat = int(u.get("veco_internal_sat") or 0)
+
+        if has_pending_veco_withdraw(con, interaction.user.id):
+            con.execute("ROLLBACK;")
+            await interaction.followup.send(
+                "You already have a pending VECO withdrawal. Please wait until it is processed.",
+                ephemeral=True,
+            )
+            return
+
+        if bal_sat < amt_sat:
+            con.execute("ROLLBACK;")
+            await interaction.followup.send(
+                f"Insufficient VECO balance. You have **{format_sat_to_veco(bal_sat)}** VECO.",
+                ephemeral=True,
+            )
+            return
+
+        con.execute(
+            "UPDATE users SET veco_internal_sat = veco_internal_sat - ?, updated_at=? WHERE discord_id=?",
+            (amt_sat, now_ts(), interaction.user.id),
+        )
+
+        cur = con.execute(
+            "INSERT INTO veco_withdrawals(ts, discord_id, to_address, amount_sat, fee_sat, txid, status, error) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (now_ts(), interaction.user.id, to_address, int(net_sat), int(fee_sat), None, "pending", None),
+        )
+        wid = int(cur.lastrowid)
+
+        con.execute("COMMIT;")
+
+    except Exception:
+        try:
+            con.execute("ROLLBACK;")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+    # Read back status/txid (watcher may have already broadcast)
+    txid = None
+    status = "pending"
+    con_s = db()
+    try:
+        row_s = con_s.execute(
+            "SELECT status, txid FROM veco_withdrawals WHERE id=?",
+            (wid,),
+        ).fetchone()
+        if row_s:
+            status = str(row_s[0] or "pending")
+            txid = (row_s[1] or "").strip() or None
+    finally:
+        try:
+            con_s.close()
+        except Exception:
+            pass
+
+    fee_line = ""
+    if int(fee_sat) > 0:
+        fee_line = f"• Fee (admin): **{format_sat_to_veco(fee_sat)} VECO**\n"
+
+    tx_line = ""
+    if txid:
+        tx_line = f"• Txid: `{txid}`\n"
+    else:
+        tx_line = f"• Status: `{status}` (txid will appear after broadcast)\n"
+
+    await interaction.followup.send(
+        f"Withdrawal queued ✅\n"
+        f"• ID: `{wid}`\n"
+        + tx_line +
+        f"• You receive: **{format_sat_to_veco(net_sat)} VECO**\n"
+        + fee_line +
+        f"• Total debited: **{format_sat_to_veco(amt_sat)} VECO**\n"
+        f"• To: `{to_address}`\n\n"
+        f"Use `/veco_withdraw_status {wid}` to check status/txid later.",
+        ephemeral=True,
+    )
+
+
+# ---- /veco_withdraw_status ----
+
+@bot.tree.command(name="veco_withdraw_status", description="Check status/txid of a VECO withdrawal request.")
+@app_commands.describe(withdraw_id="Withdrawal ID from /veco_withdraw")
+async def veco_withdraw_status(interaction: discord.Interaction, withdraw_id: int):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    wid = int(withdraw_id)
+    con = db()
+    try:
+        row = con.execute(
+            "SELECT ts, discord_id, to_address, amount_sat, fee_sat, txid, status, error FROM veco_withdrawals WHERE id=?",
+            (wid,),
+        ).fetchone()
+        if not row:
+            await interaction.followup.send("Not found.", ephemeral=True)
+            return
+
+        ts, did, to_addr, amt_sat, fee_sat, txid, status, err = row
+        if int(did) != int(interaction.user.id):
+            await interaction.followup.send("Not found.", ephemeral=True)
+            return
+
+        txid = (txid or "").strip()
+        status = str(status or "pending")
+        err = (err or "").strip()
+
+        lines = [
+            f"Withdrawal `{wid}`",
+            f"• Status: `{status}`",
+            f"• To: `{to_addr}`",
+            f"• Amount (user): **{format_sat_to_veco(int(amt_sat))} VECO**",
+        ]
+        if int(fee_sat or 0) > 0:
+            lines.append(f"• Fee (admin): **{format_sat_to_veco(int(fee_sat))} VECO**")
+        if txid:
+            lines.append(f"• Txid: `{txid}`")
+        if ts:
+            try:
+                lines.append(f"• Created: <t:{int(ts)}:R>")
+            except Exception:
+                pass
+        if err and status == "failed":
+            lines.append(f"• Error: `{err[:300]}`")
+
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+#
+# --- UI classes ---
+
+# --- Swap UI panel (ephemeral) ---
+class SwapAmountModal(discord.ui.Modal, title="Swap: Enter Amount"):
+    amount = discord.ui.TextInput(
+        label="Amount",
+        style=discord.TextStyle.short,
+        placeholder="HCC: integer (e.g. 10) | VECO: decimal (e.g. 1.25)",
+        required=True,
+        max_length=50,
+    )
+
+    def __init__(self, view: "SwapPanelView"):
+        super().__init__()
+        self._view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self._view.requester_id:
+            await interaction.response.send_message("This modal is not for you.", ephemeral=True)
+            return
+        val = str(self.amount.value or "").strip()
+        self._view.state["amount"] = val
+        await self._view.render(interaction, replace_message=True)
+
+
+class SwapSlippageModal(discord.ui.Modal, title="Swap: Slippage"):
+    slippage_pct = discord.ui.TextInput(
+        label="Slippage tolerance (%)",
+        style=discord.TextStyle.short,
+        placeholder="Example: 1 or 0.5",
+        required=True,
+        max_length=20,
+    )
+
+    def __init__(self, view: "SwapPanelView"):
+        super().__init__()
+        self._view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self._view.requester_id:
+            await interaction.response.send_message("This modal is not for you.", ephemeral=True)
+            return
+        try:
+            bps = percent_to_bps(str(self.slippage_pct.value or ""))
+        except Exception as e:
+            await interaction.response.send_message(f"Invalid slippage: `{e}`", ephemeral=True)
+            return
+        self._view.state["slippage_bps"] = int(bps)
+        await self._view.render(interaction, replace_message=True)
+
+
+class SwapPanelView(discord.ui.View):
+    def __init__(self, requester_id: int):
+        super().__init__(timeout=120)
+        self.requester_id = int(requester_id)
+        # state lives in memory; also mirrored into SWAP_SESSIONS
+        st = SWAP_SESSIONS.get(self.requester_id) or {
+            "from": "HCC",
+            "amount": "",
+            "slippage_bps": int(DEFAULT_SLIPPAGE_BPS),
+        }
+        SWAP_SESSIONS[self.requester_id] = st
+        self.state = st
+
+    def _other_asset(self, a: str) -> str:
+        return "VECO" if a == "HCC" else "HCC"
+
+    def _parse_amount_in(self) -> Tuple[Optional[int], Optional[str]]:
+        fa = str(self.state.get("from") or "HCC").upper()
+        amt_s = str(self.state.get("amount") or "").strip()
+        if not amt_s:
+            return None, None
+        if fa == "HCC":
+            if not amt_s.isdigit():
+                raise ValueError("HCC amount must be an integer")
+            v = int(amt_s)
+            if v <= 0:
+                raise ValueError("amount must be > 0")
+            return v, "HCC"
+        # VECO
+        v_sat = parse_veco_to_sat(amt_s)
+        return v_sat, "VECO"
+
+    def _build_embed(self, u: Dict[str, Any], p: Dict[str, int], quote_text: str) -> discord.Embed:
+        fa = str(self.state.get("from") or "HCC").upper()
+        ta = self._other_asset(fa)
+        slip_bps = int(self.state.get("slippage_bps") or DEFAULT_SLIPPAGE_BPS)
+        slip_pct = Decimal(slip_bps) / Decimal(100)
+
+        hcc_bal = int(u.get("balance") or 0)
+        veco_bal = int(u.get("veco_internal_sat") or 0)
+
+        # Spot price (no trade) derived from reserves
+        # VECO per HCC = R_veco / R_hcc
+        spot_veco_per_hcc = Decimal(p["veco_reserve_sat"]) / Decimal(VECO_SATS) / Decimal(max(1, p["hcc_reserve"]))
+        # HCC per VECO = R_hcc / R_veco
+        spot_hcc_per_veco = Decimal(p["hcc_reserve"]) / (Decimal(p["veco_reserve_sat"]) / Decimal(VECO_SATS) if p["veco_reserve_sat"] else Decimal("1"))
+
+        e = discord.Embed(title="Swap (HCC ⇄ VECO)")
+        e.add_field(name="From", value=fa, inline=True)
+        e.add_field(name="To", value=ta, inline=True)
+        e.add_field(name="Amount", value=(str(self.state.get("amount") or "(enter amount)")), inline=False)
+        e.add_field(name="Slippage", value=f"{slip_pct}%", inline=True)
+        e.add_field(name="Pool fee", value=f"{Decimal(p['fee_bps'])/Decimal(100)}%", inline=True)
+        e.add_field(name="Your balances", value=f"HCC: **{hcc_bal}**\nVECO: **{format_sat_to_veco(veco_bal)}**", inline=False)
+        e.add_field(
+            name="Spot price (pool)",
+            value=(
+                f"1 HCC ≈ **{spot_veco_per_hcc:.8f} VECO**\n"
+                f"1 VECO ≈ **{spot_hcc_per_veco:.4f} HCC**"
+            ),
+            inline=False,
+        )
+        e.add_field(name="Quote", value=quote_text, inline=False)
+        return e
+    @discord.ui.button(label="Max", style=discord.ButtonStyle.gray, custom_id="swap_max")
+    async def max_amount(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("This swap panel is not for you.", ephemeral=True)
+            return
+
+        con = db()
+        try:
+            u = get_or_create_user(con, self.requester_id)
+            fa = str(self.state.get("from") or "HCC").upper()
+            if fa == "HCC":
+                bal = int(u.get("balance") or 0)
+                self.state["amount"] = str(max(0, bal))
+            else:
+                bal_sat = int(u.get("veco_internal_sat") or 0)
+                self.state["amount"] = format_sat_to_veco(max(0, bal_sat))
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+
+        await self.render(interaction, replace_message=True)
+
+    async def render(self, interaction: discord.Interaction, replace_message: bool = False) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("This swap panel is not for you.", ephemeral=True)
+            return
+
+        # Compute quote
+        quote_text = "Enter an amount to see a quote."
+        can_swap = False
+        con = db()
+        try:
+            u = get_or_create_user(con, self.requester_id)
+            p = get_pool(con)
+            fa = str(self.state.get("from") or "HCC").upper()
+            slip_bps = int(self.state.get("slippage_bps") or DEFAULT_SLIPPAGE_BPS)
+
+            amt_in, parsed_asset = self._parse_amount_in()
+            if amt_in is not None and parsed_asset is not None:
+                fee_bps = int(p["fee_bps"])
+                if fa == "HCC":
+                    if int(u.get("balance") or 0) < amt_in:
+                        quote_text = "Insufficient HCC balance."
+                    else:
+                        q = quote_hcc_to_veco(int(amt_in), p["hcc_reserve"], p["veco_reserve_sat"], fee_bps)
+                        min_out = apply_slippage_min_out(q.amount_out, slip_bps)
+                        quote_text = (
+                            f"Pay: **{amt_in} HCC**\n"
+                            f"Receive (est.): **{format_sat_to_veco(q.amount_out)} VECO**\n"
+                            f"Min received: **{format_sat_to_veco(min_out)} VECO**\n"
+                            f"Fee: **{q.fee_amount} HCC**\n"
+                            f"Price impact: **{q.price_impact_bps/100:.2f}%**"
+                        )
+                        can_swap = True
+                else:
+                    if int(u.get("veco_internal_sat") or 0) < amt_in:
+                        quote_text = "Insufficient VECO balance."
+                    else:
+                        q = quote_veco_to_hcc(int(amt_in), p["hcc_reserve"], p["veco_reserve_sat"], fee_bps)
+                        min_out = apply_slippage_min_out(q.amount_out, slip_bps)
+                        quote_text = (
+                            f"Pay: **{format_sat_to_veco(amt_in)} VECO**\n"
+                            f"Receive (est.): **{q.amount_out} HCC**\n"
+                            f"Min received: **{min_out} HCC**\n"
+                            f"Fee: **{format_sat_to_veco(q.fee_amount)} VECO**\n"
+                            f"Price impact: **{q.price_impact_bps/100:.2f}%**"
+                        )
+                        can_swap = True
+
+            embed = self._build_embed(u, p, quote_text)
+        except Exception as e:
+            # If parsing fails, show error but keep panel alive
+            con.close()
+            embed = discord.Embed(title="Swap (HCC ⇄ VECO)", description=f"⚠️ {e}")
+            can_swap = False
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+
+        # Enable/disable swap button based on quote validity
+        for child in self.children:
+            if isinstance(child, discord.ui.Button) and child.custom_id == "swap_do":
+                child.disabled = not can_swap
+
+        if replace_message:
+            # Edit the existing ephemeral message
+            await interaction.response.edit_message(embed=embed, view=self)
+        else:
+            await interaction.response.send_message(embed=embed, view=self, ephemeral=True)
+
+    async def _execute_swap(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("This swap panel is not for you.", ephemeral=True)
+            return
+
+        con = db()
+        try:
+            con.execute("BEGIN IMMEDIATE;")
+
+            u = get_or_create_user(con, self.requester_id)
+            p = get_pool(con)
+
+            fa = str(self.state.get("from") or "HCC").upper()
+            slip_bps = int(self.state.get("slippage_bps") or DEFAULT_SLIPPAGE_BPS)
+            amt_in, _ = self._parse_amount_in()
+            if amt_in is None:
+                con.execute("ROLLBACK;")
+                await interaction.response.send_message("Enter an amount first.", ephemeral=True)
+                return
+
+            fee_bps = int(p["fee_bps"])
+            if fa == "HCC":
+                amt_in_hcc = int(amt_in)
+                if int(u.get("balance") or 0) < amt_in_hcc:
+                    con.execute("ROLLBACK;")
+                    await interaction.response.send_message("Insufficient HCC balance.", ephemeral=True)
+                    return
+                q = quote_hcc_to_veco(amt_in_hcc, p["hcc_reserve"], p["veco_reserve_sat"], fee_bps)
+                min_out = apply_slippage_min_out(q.amount_out, slip_bps)
+
+                out = int(q.amount_out)
+                if out < min_out:
+                    con.execute("ROLLBACK;")
+                    await interaction.response.send_message("Slippage too high. Refresh the quote.", ephemeral=True)
+                    return
+
+                new_hcc_res = p["hcc_reserve"] + (amt_in_hcc - int(q.fee_amount))
+                new_veco_res = p["veco_reserve_sat"] - out
+
+                con.execute(
+                    "UPDATE users SET balance = balance - ?, veco_internal_sat = veco_internal_sat + ?, updated_at=? WHERE discord_id=?",
+                    (amt_in_hcc, out, now_ts(), self.requester_id)
+                )
+                set_pool(con, new_hcc_res, new_veco_res, fee_bps)
+
+                con.execute(
+                    "INSERT INTO swap_log(ts, discord_id, from_asset, to_asset, amount_in, amount_out, fee_amount, price_impact_bps, status, error) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (now_ts(), self.requester_id, "HCC", "VECO", amt_in_hcc, out, int(q.fee_amount), int(q.price_impact_bps), "ok", None)
+                )
+
+                con.execute("COMMIT;")
+                await interaction.response.send_message(
+                    f"Swap successful ✅\nYou swapped **{amt_in_hcc} HCC** → **{format_sat_to_veco(out)} VECO**\n"
+                    f"Fee: {int(q.fee_amount)} HCC | Price impact: {q.price_impact_bps/100:.2f}%",
+                    ephemeral=True,
+                )
+                return
+
+            # VECO -> HCC
+            amt_in_sat = int(amt_in)
+            if int(u.get("veco_internal_sat") or 0) < amt_in_sat:
+                con.execute("ROLLBACK;")
+                await interaction.response.send_message("Insufficient VECO balance.", ephemeral=True)
+                return
+
+            q = quote_veco_to_hcc(amt_in_sat, p["hcc_reserve"], p["veco_reserve_sat"], fee_bps)
+            min_out = apply_slippage_min_out(q.amount_out, slip_bps)
+
+            out_hcc = int(q.amount_out)
+            if out_hcc < min_out:
+                con.execute("ROLLBACK;")
+                await interaction.response.send_message("Slippage too high. Refresh the quote.", ephemeral=True)
+                return
+
+            new_veco_res = p["veco_reserve_sat"] + (amt_in_sat - int(q.fee_amount))
+            new_hcc_res = p["hcc_reserve"] - out_hcc
+
+            con.execute(
+                "UPDATE users SET veco_internal_sat = veco_internal_sat - ?, balance = balance + ?, updated_at=? WHERE discord_id=?",
+                (amt_in_sat, out_hcc, now_ts(), self.requester_id)
+            )
+            set_pool(con, new_hcc_res, new_veco_res, fee_bps)
+
+            con.execute(
+                "INSERT INTO swap_log(ts, discord_id, from_asset, to_asset, amount_in, amount_out, fee_amount, price_impact_bps, status, error) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (now_ts(), self.requester_id, "VECO", "HCC", amt_in_sat, out_hcc, int(q.fee_amount), int(q.price_impact_bps), "ok", None)
+            )
+
+            con.execute("COMMIT;")
+            await interaction.response.send_message(
+                f"Swap successful ✅\nYou swapped **{format_sat_to_veco(amt_in_sat)} VECO** → **{out_hcc} HCC**\n"
+                f"Fee: {format_sat_to_veco(int(q.fee_amount))} VECO | Price impact: {q.price_impact_bps/100:.2f}%",
+                ephemeral=True,
+            )
+
+        except Exception as e:
+            try:
+                con.execute("ROLLBACK;")
+            except Exception:
+                pass
+            await interaction.response.send_message(f"Swap failed ❌ `{e}`", ephemeral=True)
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Flip", style=discord.ButtonStyle.blurple, custom_id="swap_flip")
+    async def flip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("This swap panel is not for you.", ephemeral=True)
+            return
+        fa = str(self.state.get("from") or "HCC").upper()
+        self.state["from"] = self._other_asset(fa)
+        await self.render(interaction, replace_message=True)
+
+    @discord.ui.button(label="Enter amount", style=discord.ButtonStyle.gray, custom_id="swap_amount")
+    async def enter_amount(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("This swap panel is not for you.", ephemeral=True)
+            return
+        await interaction.response.send_modal(SwapAmountModal(self))
+
+    @discord.ui.button(label="Slippage", style=discord.ButtonStyle.gray, custom_id="swap_slip")
+    async def slippage(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("This swap panel is not for you.", ephemeral=True)
+            return
+        await interaction.response.send_modal(SwapSlippageModal(self))
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.gray, custom_id="swap_refresh")
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("This swap panel is not for you.", ephemeral=True)
+            return
+        await self.render(interaction, replace_message=True)
+
+    @discord.ui.button(label="Swap", style=discord.ButtonStyle.green, custom_id="swap_do")
+    async def do_swap(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._execute_swap(interaction)
+
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.red, custom_id="swap_close")
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("This swap panel is not for you.", ephemeral=True)
+            return
+        # Disable all buttons when closing
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+        await interaction.response.edit_message(content="Swap panel closed.", embed=None, view=self)
+        self.stop()
+
+
+# --- ConfirmSwapView for CLI swap (/swap) ---
+class ConfirmSwapView(discord.ui.View):
+    def __init__(self, requester_id: int, quote_id: int):
+        super().__init__(timeout=QUOTE_TTL_SECONDS)
+        self.requester_id = int(requester_id)
+        self.quote_id = int(quote_id)
+
+    @discord.ui.button(label="Confirm Swap", style=discord.ButtonStyle.green)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("This swap confirmation is not for you.", ephemeral=True)
+            return
+
+        con = db()
+        try:
+            con.execute("BEGIN IMMEDIATE;")
+
+            # Load quote
+            q = con.execute(
+                "SELECT expires_at, discord_id, from_asset, to_asset, amount_in, amount_out, min_out, fee_amount, price_impact_bps "
+                "FROM swap_quotes WHERE id=?",
+                (self.quote_id,)
+            ).fetchone()
+            if not q:
+                con.execute("ROLLBACK;")
+                await interaction.response.send_message("Quote not found (expired). Please request a new quote.", ephemeral=True)
+                return
+
+            expires_at = int(q[0])
+            discord_id = int(q[1])
+            from_asset = str(q[2])
+            to_asset = str(q[3])
+            amount_in = int(q[4])
+            amount_out = int(q[5])
+            min_out = int(q[6])
+            fee_amount = int(q[7])
+            impact_bps = int(q[8])
+
+            if discord_id != interaction.user.id:
+                con.execute("ROLLBACK;")
+                await interaction.response.send_message("Quote owner mismatch.", ephemeral=True)
+                return
+
+            if now_ts() > expires_at:
+                con.execute("ROLLBACK;")
+                await interaction.response.send_message("Quote expired. Please request a new quote.", ephemeral=True)
+                return
+
+            # Load user + pool
+            u = get_or_create_user(con, interaction.user.id)
+            p = get_pool(con)
+
+            # Re-quote against current reserves (protects against stale quotes)
+            fee_bps = int(p["fee_bps"])
+            if from_asset == "HCC" and to_asset == "VECO":
+                if int(u.get("balance") or 0) < amount_in:
+                    con.execute("ROLLBACK;")
+                    await interaction.response.send_message("Insufficient HCC balance.", ephemeral=True)
+                    return
+                q2 = quote_hcc_to_veco(amount_in, p["hcc_reserve"], p["veco_reserve_sat"], fee_bps)
+                out2 = int(q2.amount_out)
+                if out2 < min_out:
+                    con.execute("ROLLBACK;")
+                    await interaction.response.send_message("Slippage too high. Please refresh the quote.", ephemeral=True)
+                    return
+
+                # Apply swap
+                new_hcc_res = p["hcc_reserve"] + (amount_in - q2.fee_amount)
+                new_veco_res = p["veco_reserve_sat"] - out2
+
+                con.execute("UPDATE users SET balance = balance - ?, veco_internal_sat = veco_internal_sat + ?, updated_at=? WHERE discord_id=?",
+                            (amount_in, out2, now_ts(), interaction.user.id))
+                set_pool(con, new_hcc_res, new_veco_res, fee_bps)
+
+                con.execute(
+                    "INSERT INTO swap_log(ts, discord_id, from_asset, to_asset, amount_in, amount_out, fee_amount, price_impact_bps, status, error) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (now_ts(), interaction.user.id, "HCC", "VECO", amount_in, out2, int(q2.fee_amount), int(q2.price_impact_bps), "ok", None)
+                )
+
+                con.execute("COMMIT;")
+
+                await interaction.response.send_message(
+                    f"Swap successful ✅\nYou swapped **{amount_in} HCC** → **{format_sat_to_veco(out2)} VECO**\n"
+                    f"Fee: {int(q2.fee_amount)} HCC | Price impact: {q2.price_impact_bps/100:.2f}%",
+                    ephemeral=True,
+                )
+                self.stop()
+                return
+
+            if from_asset == "VECO" and to_asset == "HCC":
+                if int(u.get("veco_internal_sat") or 0) < amount_in:
+                    con.execute("ROLLBACK;")
+                    await interaction.response.send_message("Insufficient VECO balance.", ephemeral=True)
+                    return
+                q2 = quote_veco_to_hcc(amount_in, p["hcc_reserve"], p["veco_reserve_sat"], fee_bps)
+                out2 = int(q2.amount_out)
+                if out2 < min_out:
+                    con.execute("ROLLBACK;")
+                    await interaction.response.send_message("Slippage too high. Please refresh the quote.", ephemeral=True)
+                    return
+
+                new_veco_res = p["veco_reserve_sat"] + (amount_in - q2.fee_amount)
+                new_hcc_res = p["hcc_reserve"] - out2
+
+                con.execute("UPDATE users SET veco_internal_sat = veco_internal_sat - ?, balance = balance + ?, updated_at=? WHERE discord_id=?",
+                            (amount_in, out2, now_ts(), interaction.user.id))
+                set_pool(con, new_hcc_res, new_veco_res, fee_bps)
+
+                con.execute(
+                    "INSERT INTO swap_log(ts, discord_id, from_asset, to_asset, amount_in, amount_out, fee_amount, price_impact_bps, status, error) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (now_ts(), interaction.user.id, "VECO", "HCC", amount_in, out2, int(q2.fee_amount), int(q2.price_impact_bps), "ok", None)
+                )
+
+                con.execute("COMMIT;")
+
+                await interaction.response.send_message(
+                    f"Swap successful ✅\nYou swapped **{format_sat_to_veco(amount_in)} VECO** → **{out2} HCC**\n"
+                    f"Fee: {format_sat_to_veco(int(q2.fee_amount))} VECO | Price impact: {q2.price_impact_bps/100:.2f}%",
+                    ephemeral=True,
+                )
+                self.stop()
+                return
+
+            con.execute("ROLLBACK;")
+            await interaction.response.send_message("Unsupported swap direction.", ephemeral=True)
+
+        except Exception as e:
+            try:
+                con.execute("ROLLBACK;")
+            except Exception:
+                pass
+            await interaction.response.send_message(f"Swap failed ❌ `{e}`", ephemeral=True)
+        finally:
+            con.close()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.gray)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("This is not for you.", ephemeral=True)
+            return
+        await interaction.response.send_message("Cancelled.", ephemeral=True)
+        self.stop()
+
+
+
+@bot.tree.command(name="ui_swap", description="Open the swap UI (ephemeral).")
+async def swap_ui(interaction: discord.Interaction):
+    view = SwapPanelView(interaction.user.id)
+    await view.render(interaction, replace_message=False)
+
+
+@bot.tree.command(name="swap", description="Swap between internal HCC (integer) and internal VECO (8 decimals).")
+@app_commands.describe(
+    from_asset="Asset you pay (HCC or VECO)",
+    amount="Amount you pay (HCC integer, VECO decimal)",
+    slippage_pct="Max slippage in percent (e.g., 1 or 0.5)"
+)
+async def swap(interaction: discord.Interaction, from_asset: str, amount: str, slippage_pct: str = "1"):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    fa = (from_asset or "").strip().upper()
+    if fa not in ("HCC", "VECO"):
+        await interaction.followup.send("from_asset must be `HCC` or `VECO`.", ephemeral=True)
+        return
+
+    try:
+        slippage_bps = percent_to_bps(str(slippage_pct))
+    except Exception:
+        slippage_bps = int(DEFAULT_SLIPPAGE_BPS)
+
+    # Parse input amount
+    try:
+        if fa == "HCC":
+            amt_in = int(str(amount).strip())
+            if amt_in <= 0:
+                raise ValueError("amount must be > 0")
+            ta = "VECO"
+        else:
+            amt_in = parse_veco_to_sat(str(amount))
+            ta = "HCC"
+    except Exception as e:
+        await interaction.followup.send(f"Invalid amount: `{e}`", ephemeral=True)
+        return
+
+    con = db()
+    try:
+        u = get_or_create_user(con, interaction.user.id)
+        p = get_pool(con)
+
+        fee_bps = int(p["fee_bps"])
+        if fa == "HCC":
+            if int(u.get("balance") or 0) < amt_in:
+                await interaction.followup.send("Insufficient HCC balance.", ephemeral=True)
+                return
+            q = quote_hcc_to_veco(amt_in, p["hcc_reserve"], p["veco_reserve_sat"], fee_bps)
+            min_out = apply_slippage_min_out(q.amount_out, slippage_bps)
+
+            # Store quote
+            ts = now_ts()
+            exp = ts + QUOTE_TTL_SECONDS
+            con.execute(
+                "INSERT INTO swap_quotes(ts, expires_at, discord_id, from_asset, to_asset, amount_in, amount_out, min_out, fee_amount, price_impact_bps) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (ts, exp, interaction.user.id, "HCC", "VECO", int(amt_in), int(q.amount_out), int(min_out), int(q.fee_amount), int(q.price_impact_bps))
+            )
+            quote_id = int(con.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+            await interaction.followup.send(
+                f"**Quote (HCC → VECO)**\n"
+                f"Pay: **{amt_in} HCC**\n"
+                f"Receive (est.): **{format_sat_to_veco(q.amount_out)} VECO**\n"
+                f"Min received (@ {Decimal(slippage_bps)/Decimal(100):.2f}% slippage): **{format_sat_to_veco(min_out)} VECO**\n"
+                f"Fee: **{q.fee_amount} HCC** | Price impact: **{q.price_impact_bps/100:.2f}%**\n"
+                f"(Quote expires in {QUOTE_TTL_SECONDS}s)",
+                view=ConfirmSwapView(interaction.user.id, quote_id),
+                ephemeral=True,
+            )
+            return
+
+        # VECO -> HCC
+        if int(u.get("veco_internal_sat") or 0) < amt_in:
+            await interaction.followup.send("Insufficient VECO balance.", ephemeral=True)
+            return
+        q = quote_veco_to_hcc(amt_in, p["hcc_reserve"], p["veco_reserve_sat"], fee_bps)
+        min_out = apply_slippage_min_out(q.amount_out, slippage_bps)
+
+        ts = now_ts()
+        exp = ts + QUOTE_TTL_SECONDS
+        con.execute(
+            "INSERT INTO swap_quotes(ts, expires_at, discord_id, from_asset, to_asset, amount_in, amount_out, min_out, fee_amount, price_impact_bps) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (ts, exp, interaction.user.id, "VECO", "HCC", int(amt_in), int(q.amount_out), int(min_out), int(q.fee_amount), int(q.price_impact_bps))
+        )
+        quote_id = int(con.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+        await interaction.followup.send(
+            f"**Quote (VECO → HCC)**\n"
+            f"Pay: **{format_sat_to_veco(amt_in)} VECO**\n"
+            f"Receive (est.): **{q.amount_out} HCC**\n"
+            f"Min received (@ {Decimal(slippage_bps)/Decimal(100):.2f}% slippage): **{min_out} HCC**\n"
+            f"Fee: **{format_sat_to_veco(q.fee_amount)} VECO** | Price impact: **{q.price_impact_bps/100:.2f}%**\n"
+            f"(Quote expires in {QUOTE_TTL_SECONDS}s)",
+            view=ConfirmSwapView(interaction.user.id, quote_id),
+            ephemeral=True,
+        )
+
+    except Exception as e:
+        await interaction.followup.send(f"Swap quote failed ❌ `{e}`", ephemeral=True)
+    finally:
+        con.close()
 
 
 def main():
