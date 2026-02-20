@@ -139,8 +139,20 @@ def dump_tx_log(con: sqlite3.Connection, limit: int, only_type: Optional[str], o
     params: List[Any] = []
 
     if only_type:
-        where.append("type = ?")
-        params.append(only_type)
+        # Support comma-separated types and a special shorthand: "lottery"
+        t = str(only_type).strip()
+        if t.lower() == "lottery":
+            # Show lottery-related bookkeeping in tx_log.
+            # We match common patterns by type prefix and a fallback note match.
+            where.append("(type LIKE 'lottery_%' OR type IN ('lottery_ticket','lottery_payout','lottery_seed','lottery_house_fee') OR note LIKE '%lottery%')")
+        else:
+            parts = [p.strip() for p in t.split(",") if p.strip()]
+            if len(parts) == 1:
+                where.append("type = ?")
+                params.append(parts[0])
+            else:
+                where.append("type IN (%s)" % ",".join(["?"] * len(parts)))
+                params.extend(parts)
     if only_status:
         where.append("status = ?")
         params.append(only_status)
@@ -221,6 +233,120 @@ def dump_swap_log(con: sqlite3.Connection, limit: int, only_status: Optional[str
     )
 
 
+def dump_lottery_rounds(con: sqlite3.Connection, limit: int) -> None:
+    if not table_exists(con, "lottery_rounds"):
+        print("Table 'lottery_rounds' not found.")
+        return
+
+    cols = table_columns(con, "lottery_rounds")
+    order_col = "id" if "id" in cols else ("created_at" if "created_at" in cols else cols[0])
+
+    q = f"SELECT {', '.join(cols)} FROM lottery_rounds ORDER BY {order_col} DESC LIMIT ?"
+    rows = fetch_all(con, q, (max(1, limit),))
+
+    pretty_rows: List[Tuple[Any, ...]] = []
+    for r in rows:
+        out: List[Any] = []
+        for i, v in enumerate(r):
+            cname = cols[i]
+            if cname in ("ts", "created_at", "updated_at", "ends_at", "start_ts", "end_ts"):
+                out.append(fmt_ts(v))
+            elif cname in ("commit", "reveal", "error", "note"):
+                out.append(shorten(v, 60))
+            elif isinstance(v, str):
+                out.append(shorten(v, 60))
+            else:
+                out.append(v)
+        pretty_rows.append(tuple(out))
+
+    print_table(f"LOTTERY_ROUNDS (last {min(limit, len(pretty_rows))})", cols, pretty_rows)
+
+
+def dump_lottery_tickets(con: sqlite3.Connection, limit: int) -> None:
+    if not table_exists(con, "lottery_tickets"):
+        print("Table 'lottery_tickets' not found.")
+        return
+
+    cols = table_columns(con, "lottery_tickets")
+    order_col = "id" if "id" in cols else ("created_at" if "created_at" in cols else cols[0])
+
+    q = f"SELECT {', '.join(cols)} FROM lottery_tickets ORDER BY {order_col} DESC LIMIT ?"
+    rows = fetch_all(con, q, (max(1, limit),))
+
+    pretty_rows: List[Tuple[Any, ...]] = []
+    for r in rows:
+        out: List[Any] = []
+        for i, v in enumerate(r):
+            cname = cols[i]
+            if cname in ("ts", "created_at", "updated_at"):
+                out.append(fmt_ts(v))
+            elif cname in ("note", "meta"):
+                out.append(shorten(v, 60))
+            elif isinstance(v, str):
+                out.append(shorten(v, 60))
+            else:
+                out.append(v)
+        pretty_rows.append(tuple(out))
+
+    print_table(f"LOTTERY_TICKETS (last {min(limit, len(pretty_rows))})", cols, pretty_rows)
+
+
+def dump_lottery_payouts(con: sqlite3.Connection, limit: int) -> None:
+    if not table_exists(con, "lottery_payouts"):
+        print("Table 'lottery_payouts' not found.")
+        return
+
+    cols = table_columns(con, "lottery_payouts")
+    order_col = "id" if "id" in cols else ("created_at" if "created_at" in cols else cols[0])
+
+    q = f"SELECT {', '.join(cols)} FROM lottery_payouts ORDER BY {order_col} DESC LIMIT ?"
+    rows = fetch_all(con, q, (max(1, limit),))
+
+    pretty_rows: List[Tuple[Any, ...]] = []
+    for r in rows:
+        out: List[Any] = []
+        for i, v in enumerate(r):
+            cname = cols[i]
+            if cname in ("ts", "created_at", "updated_at"):
+                out.append(fmt_ts(v))
+            elif cname in ("note", "error"):
+                out.append(shorten(v, 60))
+            elif isinstance(v, str):
+                out.append(shorten(v, 60))
+            else:
+                out.append(v)
+        pretty_rows.append(tuple(out))
+
+    print_table(f"LOTTERY_PAYOUTS (last {min(limit, len(pretty_rows))})", cols, pretty_rows)
+
+
+def dump_lottery_state(con: sqlite3.Connection) -> None:
+    if not table_exists(con, "lottery_state"):
+        print("Table 'lottery_state' not found.")
+        return
+
+    cols = table_columns(con, "lottery_state")
+    q = f"SELECT {', '.join(cols)} FROM lottery_state ORDER BY id DESC LIMIT 5"
+    rows = fetch_all(con, q)
+
+    pretty_rows: List[Tuple[Any, ...]] = []
+    for r in rows:
+        out: List[Any] = []
+        for i, v in enumerate(r):
+            cname = cols[i]
+            if cname in ("ts", "created_at", "updated_at", "last_tick_ts"):
+                out.append(fmt_ts(v))
+            elif cname in ("commit", "reveal", "note", "error"):
+                out.append(shorten(v, 80))
+            elif isinstance(v, str):
+                out.append(shorten(v, 80))
+            else:
+                out.append(v)
+        pretty_rows.append(tuple(out))
+
+    print_table("LOTTERY_STATE (last 5)", cols, pretty_rows)
+
+
 def dump_schema(con: sqlite3.Connection) -> None:
     rows = fetch_all(
         con,
@@ -241,19 +367,30 @@ def main() -> None:
     ap.add_argument("--swaps", action="store_true", help="Dump swap_log table (recent swaps)")
     ap.add_argument("--schema", action="store_true", help="Dump DB schema")
     ap.add_argument("--limit", type=int, default=50, help="Limit rows (default: 50). For --tx this is last N entries.")
-    ap.add_argument("--tx-type", default="", help="Filter tx_log by type (tip|grant|withdraw)")
+    ap.add_argument("--tx-type", default="", help="Filter tx_log by type. Supports comma-separated values (e.g. tip,grant) or 'lottery' for lottery-related entries.")
     ap.add_argument("--tx-status", default="", help="Filter tx_log by status (ok|pending|failed)")
     ap.add_argument("--swap-status", default="", help="Filter swap_log by status if column exists")
 
+    ap.add_argument("--lottery", action="store_true", help="Shortcut: dump only lottery-related entries from tx_log (same as --tx-type lottery)")
+    ap.add_argument("--lottery-tables", action="store_true", help="Dump dedicated lottery_* tables (tickets/rounds/payouts/state)")
+
     args = ap.parse_args()
 
+    if getattr(args, "lottery", False):
+        # Lottery data is stored in dedicated tables; also include tx_log filter as a best-effort.
+        args.tx = True
+        args.tx_type = "lottery"
+        # Also dump dedicated lottery tables
+        args.lottery_tables = True
+
     # If no section chosen, dump everything
-    if not (args.users or args.limits or args.tx or args.swaps or args.schema):
+    if not (args.users or args.limits or args.tx or args.swaps or args.schema or getattr(args, "lottery_tables", False)):
         args.schema = True
         args.users = True
         args.limits = True
         args.tx = True
         args.swaps = True
+        args.lottery_tables = True
 
     con = sqlite3.connect(args.db)
     try:
@@ -277,6 +414,11 @@ def main() -> None:
                 limit=max(1, args.limit),
                 only_status=args.swap_status.strip() or None,
             )
+        if getattr(args, "lottery_tables", False):
+            dump_lottery_state(con)
+            dump_lottery_rounds(con, limit=max(1, args.limit))
+            dump_lottery_tickets(con, limit=max(1, args.limit))
+            dump_lottery_payouts(con, limit=max(1, args.limit))
     finally:
         con.close()
 

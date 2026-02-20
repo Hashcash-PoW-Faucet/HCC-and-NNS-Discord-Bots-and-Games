@@ -58,7 +58,6 @@ def fmt_num(x: float) -> str:
     return s
 
 
-
 def load_names_cache(path: str) -> Dict[str, str]:
     """Load a Discord-ID -> display-name cache from JSON.
 

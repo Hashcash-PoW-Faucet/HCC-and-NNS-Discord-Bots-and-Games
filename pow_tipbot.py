@@ -909,6 +909,7 @@ async def hcc_deposit(interaction: discord.Interaction, amount: str):
     )
 
 
+
 @bot.tree.command(name="tip", description="Tip HCC to another user.")
 @app_commands.describe(user="Recipient", amount="Amount to tip", note="Optional note")
 async def tip(interaction: discord.Interaction, user: discord.User, amount: int, note: Optional[str] = None):
@@ -971,6 +972,142 @@ async def tip(interaction: discord.Interaction, user: discord.User, amount: int,
     await interaction.followup.send(
         f"Tip sent ✅ You tipped {user.mention} **{amount}** HCC.",
         ephemeral=True
+    )
+
+
+# ---- multitip ----
+@bot.tree.command(name="multitip", description="Tip the same HCC amount to multiple users.")
+@app_commands.describe(
+    amount="Amount of HCC to tip EACH user",
+    users="Space-separated @mentions or user IDs (e.g. @a @b @c)",
+    note="Optional note"
+)
+async def multitip(interaction: discord.Interaction, amount: int, users: str, note: Optional[str] = None):
+    """Tip the same amount to multiple recipients in one atomic DB transaction.
+
+    We accept a single `users` string because Discord slash commands don't support variadic args.
+    Supported formats inside `users`:
+      - Mentions: <@123> or <@!123>
+      - Raw IDs: 1234567890
+    """
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    if amount <= 0:
+        await interaction.followup.send("Amount must be positive.", ephemeral=True)
+        return
+
+    raw = (users or "").strip()
+    if not raw:
+        await interaction.followup.send("Please provide at least one recipient (@mention or user id).", ephemeral=True)
+        return
+
+    # Extract IDs from mentions or raw numeric tokens
+    ids: List[int] = []
+    for tok in raw.split():
+        t = tok.strip()
+        if not t:
+            continue
+        # mention variants
+        if t.startswith("<@") and t.endswith(">"):
+            t2 = t[2:-1]
+            if t2.startswith("!"):
+                t2 = t2[1:]
+            if t2.isdigit():
+                ids.append(int(t2))
+            continue
+        # raw id
+        if t.isdigit():
+            ids.append(int(t))
+
+    # De-duplicate while preserving order
+    seen: set[int] = set()
+    uniq_ids: List[int] = []
+    for did in ids:
+        if did not in seen:
+            seen.add(did)
+            uniq_ids.append(did)
+
+    # Remove self if present
+    uniq_ids = [did for did in uniq_ids if did != interaction.user.id]
+
+    if not uniq_ids:
+        await interaction.followup.send("No valid recipients found (or you only included yourself).", ephemeral=True)
+        return
+
+    # Hard cap to prevent abuse / huge locks
+    MAX_RECIPIENTS = 10
+    if len(uniq_ids) > MAX_RECIPIENTS:
+        await interaction.followup.send(
+            f"Too many recipients. Max is {MAX_RECIPIENTS} per /multitip.",
+            ephemeral=True,
+        )
+        return
+
+    total = int(amount) * len(uniq_ids)
+
+    con = db()
+    try:
+        con.execute("BEGIN IMMEDIATE;")
+
+        sender = get_or_create_user(con, interaction.user.id)
+        if int(sender.get("balance") or 0) < total:
+            con.execute("ROLLBACK;")
+            await interaction.followup.send(
+                f"Insufficient balance. You have **{sender['balance']}** HCC but need **{total}** HCC.",
+                ephemeral=True,
+            )
+            return
+
+        ts = now_ts()
+
+        # Debit sender once
+        con.execute(
+            "UPDATE users SET balance = balance - ?, updated_at=? WHERE discord_id=?",
+            (total, ts, interaction.user.id),
+        )
+
+        # Credit each recipient + log each transfer
+        for rid in uniq_ids:
+            get_or_create_user(con, rid)
+            con.execute(
+                "UPDATE users SET balance = balance + ?, updated_at=? WHERE discord_id=?",
+                (int(amount), ts, rid),
+            )
+            con.execute(
+                "INSERT INTO tx_log(ts, type, from_id, to_id, amount, note, status) VALUES(?,?,?,?,?,?,?)",
+                (ts, "tip", interaction.user.id, rid, int(amount), (note or ""), "ok"),
+            )
+
+        con.execute("COMMIT;")
+
+    except Exception:
+        try:
+            con.execute("ROLLBACK;")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+    # Best-effort: build mention list for response
+    mention_list = " ".join([f"<@{rid}>" for rid in uniq_ids])
+
+    # Optional public announcement
+    if PUBLIC_TIP_ANNOUNCEMENTS and interaction.channel is not None:
+        try:
+            note_txt = f" — {note}" if note else ""
+            await interaction.channel.send(
+                f"💸 {interaction.user.mention} multi-tipped **{amount}** HCC to {mention_list} (total {total} HCC){note_txt}"
+            )
+        except Exception:
+            pass
+
+    await interaction.followup.send(
+        f"Multi-tip sent ✅\n"
+        f"Each: **{amount}** HCC\n"
+        f"Recipients ({len(uniq_ids)}): {mention_list}\n"
+        f"Total: **{total}** HCC",
+        ephemeral=True,
     )
 
 
