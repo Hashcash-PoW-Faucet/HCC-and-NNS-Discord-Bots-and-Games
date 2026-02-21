@@ -1637,7 +1637,6 @@ async def lottery_help_cmd(interaction: discord.Interaction):
         "• `/lastdraw` — last paid draw\n\n"
         f"Ticket price: **{TICKET_PRICE_HCC} HCC** | House fee: **{HOUSE_FEE_BPS/100:.2f}%** (tickets only)\n"
         f"Regular payouts: **{REGULAR_POOL_BPS/100:.2f}%** of total pot per round | Jackpot: **{JACKPOT_CHANCE_BPS/100:.0f}%** chance of **{JACKPOT_PCT_BPS/100:.0f}%** pot" + (f" (cap {JACKPOT_CAP_HCC} HCC)" if JACKPOT_CAP_HCC>0 else "") + "\n"
-        "Tip: Seed a starting pot so people feel it’s worth buying tickets."
     )
     await interaction.followup.send(msg, ephemeral=True)
 

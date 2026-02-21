@@ -5,7 +5,7 @@ import time
 import sqlite3
 from typing import Optional, Dict, Any, Tuple, List
 
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -170,11 +170,18 @@ def quote_veco_to_hcc(amount_in_sat: int, R_hcc: int, R_veco_sat: int, fee_bps: 
     if out <= 0:
         raise ValueError("insufficient liquidity")
 
-    p0 = (R_hcc * 1_000_000) // R_veco_sat
-    pe = (out * 1_000_000) // max(1, amount_in_sat)
+    # price impact (bps) vs spot, excluding fee
+    # spot_out = dx * (R_hcc / R_veco_sat)
     impact_bps = 0
-    if p0 > 0 and pe < p0:
-        impact_bps = ((p0 - pe) * 10_000) // p0
+    if R_veco_sat > 0 and R_hcc > 0 and out > 0 and dx > 0:
+        spot_out = (Decimal(dx) * Decimal(R_hcc)) / Decimal(R_veco_sat)
+        if spot_out > 0:
+            impact = (spot_out - Decimal(out)) / spot_out
+            if impact < 0:
+                impact = Decimal("0")
+            impact_bps = int((impact * Decimal("10000")).to_integral_value(rounding=ROUND_HALF_UP))
+            if impact_bps < 0:
+                impact_bps = 0
 
     return AmmQuote(amount_out=out, fee_amount=fee, price_impact_bps=int(impact_bps))
 
