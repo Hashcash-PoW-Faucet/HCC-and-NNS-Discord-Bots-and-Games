@@ -240,12 +240,16 @@ def current_payout_slot(ts: int) -> int:
     return ts // interval
 
 
-# --- Helper: Format seconds as H:M:S ---
+# --- Helper: Format seconds as D:H:M:S (days only shown when >= 24h) ---
 def fmt_duration_hms(seconds: int) -> str:
+    """Format a duration as Dd Hh Mm Ss (days only shown when >= 24h)."""
     seconds = max(0, int(seconds or 0))
-    h = seconds // 3600
+    d = seconds // 86400
+    h = (seconds % 86400) // 3600
     m = (seconds % 3600) // 60
     s = seconds % 60
+    if d > 0:
+        return f"{d}d {h}h {m}m {s}s"
     return f"{h}h {m}m {s}s"
 
 
@@ -458,10 +462,8 @@ class MinerView(View):
                 upgrade_time = rig.get("upgrade_ready_time") or 0
                 if upgrade_time > now:
                     remaining = int(upgrade_time - now)
-                    hours = remaining // 3600
-                    mins = (remaining % 3600) // 60
                     await interaction.response.send_message(
-                        f"⏳ Rig upgrade already in progress. Ready in {hours}h {mins}m.",
+                        f"⏳ Rig upgrade already in progress. Ready in {fmt_duration_hms(remaining)}.",
                         ephemeral=True
                     )
                     return
@@ -484,7 +486,7 @@ class MinerView(View):
                 rig["upgrade_ready_time"] = now + duration_minutes * 60
                 view.miner_bot.update_user_rig(view.user_id, rig)
                 await interaction.response.send_message(
-                    f"🏗️ Rig upgrade started! It will complete in {int(duration_minutes // 60)}h {int(duration_minutes % 60)}m.",
+                    f"🏗️ Rig upgrade started! It will complete in {fmt_duration_hms(int(duration_minutes * 60))}.",
                     ephemeral=True
                 )
             except Exception as e:
@@ -554,10 +556,8 @@ class SelectAsicButton(discord.ui.Button):
             upgrade_ready_time = asic.get("upgrade_ready_time")
             if upgrade_ready_time is not None and now < upgrade_ready_time:
                 remaining = int(upgrade_ready_time - now)
-                hours = remaining // 3600
-                mins = (remaining % 3600) // 60
                 await interaction.response.send_message(
-                    f"Upgrade in progress. Ready in {hours}h {mins}m.", ephemeral=True
+                    f"Upgrade in progress. Ready in {fmt_duration_hms(remaining)}.", ephemeral=True
                 )
                 return
             rig_level = rig.get("rig_level", 1)
@@ -584,9 +584,7 @@ class SelectAsicButton(discord.ui.Button):
             duration_minutes = BASE_UPGRADE_TIME_MINUTES * (1.5 ** (current_stars + 1))
             asic["upgrade_ready_time"] = now + duration_minutes * 60
             view.miner_bot.update_user_rig(view.user_id, rig)
-            hours = int(duration_minutes // 60)
-            mins = int(duration_minutes % 60)
-            msg = f"⏳ Upgrade started: This ASIC will reach {current_stars + 1}⭐ in {hours}h {mins}m."
+            msg = f"⏳ Upgrade started: This ASIC will reach {current_stars + 1}⭐ in {fmt_duration_hms(int(duration_minutes * 60))}."
             if interaction.response.is_done():
                 await interaction.followup.send(message=msg, ephemeral=True)
             else:
@@ -657,10 +655,8 @@ class SelectGpuButton(discord.ui.Button):
         upgrade_ready_time = gpu.get("upgrade_ready_time")
         if upgrade_ready_time is not None and now < upgrade_ready_time:
             remaining = int(upgrade_ready_time - now)
-            hours = remaining // 3600
-            mins = (remaining % 3600) // 60
             await interaction.response.send_message(
-                f"Upgrade in progress. Ready in {hours}h {mins}m.", ephemeral=True
+                f"Upgrade in progress. Ready in {fmt_duration_hms(remaining)}.", ephemeral=True
             )
             return
         rig_level = rig.get("rig_level", 1)
@@ -687,10 +683,8 @@ class SelectGpuButton(discord.ui.Button):
         duration_minutes = BASE_UPGRADE_TIME_MINUTES * (1.5 ** (current_stars + 1))
         gpu["upgrade_ready_time"] = now + duration_minutes * 60
         view.miner_bot.update_user_rig(view.user_id, rig)
-        hours = int(duration_minutes // 60)
-        mins = int(duration_minutes % 60)
         await interaction.response.send_message(
-            f"⏳ GPU upgrade to {current_stars + 1}⭐ started! Time until completion: {hours}h {mins}m",
+            f"⏳ GPU upgrade to {current_stars + 1}⭐ started! Time until completion: {fmt_duration_hms(int(duration_minutes * 60))}",
             ephemeral=True
         )
 
@@ -808,9 +802,7 @@ class MinerGameBot:
         upgrade_time = rig.get("upgrade_ready_time")
         if upgrade_time is not None and now < upgrade_time:
             remaining = int(upgrade_time - now)
-            hours = remaining // 3600
-            minutes = (remaining % 3600) // 60
-            upgrade_status = f"⏳ Upgrade ready in {hours}h {minutes}m"
+            upgrade_status = f"⏳ Upgrade ready in {fmt_duration_hms(remaining)}"
         elif upgrade_time and now >= upgrade_time:
             upgrade_status = "✅ Upgrade complete! (Applied)"
         else:
@@ -1092,7 +1084,6 @@ def run_bot(stop_event=None):
         loop.run_until_complete(runner())
     finally:
         loop.close()
-
 
 
 def main():
