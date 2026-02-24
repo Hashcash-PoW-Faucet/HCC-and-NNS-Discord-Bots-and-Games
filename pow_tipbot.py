@@ -47,6 +47,7 @@ def parse_veco_to_sat(s: str) -> int:
     return sat
 
 
+#
 # ---------------------------
 # Config
 # ---------------------------
@@ -89,6 +90,15 @@ ADDR_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 TIPBOT_FERNET_KEY = os.environ.get("TIPBOT_FERNET_KEY", "").strip()
 
 # ---------------------------
+# Faucet (Discord claim into internal HCC balance)
+# ---------------------------
+FAUCET_AMOUNT = int(os.environ.get("FAUCET_AMOUNT", "4"))
+FAUCET_COOLDOWN_SECONDS = int(os.environ.get("FAUCET_COOLDOWN_SECONDS", str(2 * 3600)))
+FAUCET_ALLOWED_CHANNEL_ID = os.environ.get("FAUCET_ALLOWED_CHANNEL_ID", "").strip()
+PUBLIC_CLAIM_ANNOUNCEMENTS = os.environ.get("PUBLIC_CLAIM_ANNOUNCEMENTS", "1").strip() == "1"
+PUBLIC_CLAIM_SHOW_ADDRESS = os.environ.get("PUBLIC_CLAIM_SHOW_ADDRESS", "0").strip() == "1"
+
+# ---------------------------
 # AMM Swap (HCC <-> VECO)
 # ---------------------------
 DEFAULT_POOL_HCC = int(os.environ.get("AMM_INIT_HCC", "40000"))
@@ -98,6 +108,7 @@ DEFAULT_SLIPPAGE_BPS = int(os.environ.get("AMM_DEFAULT_SLIPPAGE_BPS", "100"))  #
 QUOTE_TTL_SECONDS = int(os.environ.get("AMM_QUOTE_TTL", "30"))
 
 
+#
 # ---------------------------
 # Helpers
 # ---------------------------
@@ -108,6 +119,26 @@ def now_ts() -> int:
 def day_key(ts: Optional[int] = None) -> str:
     ts = ts or now_ts()
     return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
+# Faucet helpers
+def fmt_duration_hms(seconds: int) -> str:
+    """Format a duration in seconds as '<h>h <m>m <s>s'."""
+    seconds = max(0, int(seconds or 0))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h}h {m}m {s}s"
+
+
+def channel_allowed(interaction: discord.Interaction) -> bool:
+    """Optionally restrict faucet-style commands to a single channel."""
+    if not FAUCET_ALLOWED_CHANNEL_ID:
+        return True
+    try:
+        return interaction.channel_id == int(FAUCET_ALLOWED_CHANNEL_ID)
+    except Exception:
+        return False
 
 
 def normalize_addr(addr: str) -> str:
@@ -348,6 +379,14 @@ def init_db() -> None:
     );
     """)
 
+    # Faucet cooldown table
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS faucet_claims (
+      discord_id INTEGER PRIMARY KEY,
+      last_claim_at INTEGER NOT NULL DEFAULT 0
+    );
+    """)
+
     con.execute("""
     CREATE TABLE IF NOT EXISTS swap_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -442,6 +481,24 @@ def set_withdrawn_today(con: sqlite3.Connection, discord_id: int, dk: str, val: 
     con.execute(
         "UPDATE daily_limits SET withdrawn_today=? WHERE discord_id=? AND day=?",
         (int(val), discord_id, dk)
+    )
+
+# Faucet cooldown helpers
+def get_last_claim_at(con: sqlite3.Connection, discord_id: int) -> int:
+    row = con.execute(
+        "SELECT last_claim_at FROM faucet_claims WHERE discord_id=?",
+        (int(discord_id),)
+    ).fetchone()
+    if row and row[0] is not None:
+        return int(row[0])
+    return 0
+
+
+def set_last_claim_at(con: sqlite3.Connection, discord_id: int, ts: int) -> None:
+    con.execute(
+        "INSERT INTO faucet_claims(discord_id, last_claim_at) VALUES(?,?) "
+        "ON CONFLICT(discord_id) DO UPDATE SET last_claim_at=excluded.last_claim_at",
+        (int(discord_id), int(ts))
     )
 
 
@@ -612,6 +669,7 @@ async def help_cmd(interaction: discord.Interaction):
         "• `/hcc_register_address <address>` – Set your HCC withdrawal address (40 hex)\n"
         "• `/tip @user <amount> [note]` – Tip HCC to another user (internal)\n"
         "• `/hcc_withdraw <amount>` – Withdraw HCC to your registered address (via treasury)\n"
+        f"• `/claim` – Claim {FAUCET_AMOUNT} HCC (cooldown: {int(FAUCET_COOLDOWN_SECONDS)//3600}h)\n"
         "• `/whoami` – Show your registered addresses and limits\n"
         "\n"
         "**VECO (on-chain ↔ Discord internal)**\n"
@@ -635,6 +693,116 @@ async def help_cmd(interaction: discord.Interaction):
         "• Safety: withdrawing VECO to any bot-managed deposit address is blocked.\n"
     )
     await interaction.response.send_message(text, ephemeral=True)
+
+
+# ---------------------------
+# Faucet claim command
+# ---------------------------
+
+@bot.tree.command(name="claim", description="Claim HCC into your internal balance (cooldown).")
+async def claim(interaction: discord.Interaction):
+    if not channel_allowed(interaction):
+        await interaction.response.send_message("This command is not allowed in this channel.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    t = now_ts()
+    con = db()
+    to_addr = None
+    new_bal = None
+
+    try:
+        con.execute("BEGIN IMMEDIATE;")
+
+        u = get_or_create_user(con, interaction.user.id)
+
+        # Require HCC withdraw address to be set before claiming
+        to_addr = (u.get("address") or "").strip()
+        if not to_addr:
+            con.execute("ROLLBACK;")
+            await interaction.followup.send(
+                "Not registered yet. Please set your HCC withdraw address first with `/hcc_register_address <address>`.\n"
+                "Then you can claim with `/claim`.",
+                ephemeral=True,
+            )
+            return
+
+        # basic sanity of stored address
+        try:
+            to_addr = normalize_addr(to_addr)
+        except Exception:
+            con.execute("ROLLBACK;")
+            await interaction.followup.send(
+                "Your stored HCC address has an invalid format. Please re-register using `/hcc_register_address <address>`.",
+                ephemeral=True,
+            )
+            return
+
+        # Cooldown
+        last_claim = get_last_claim_at(con, interaction.user.id)
+        if last_claim and t < last_claim + int(FAUCET_COOLDOWN_SECONDS):
+            rem = (last_claim + int(FAUCET_COOLDOWN_SECONDS)) - t
+            con.execute("ROLLBACK;")
+            await interaction.followup.send(
+                f"Cooldown ⏳ Try again in ~{fmt_duration_hms(rem)}.",
+                ephemeral=True,
+            )
+            return
+
+        # Credit internal balance + persist cooldown
+        con.execute(
+            "UPDATE users SET balance = balance + ?, updated_at=? WHERE discord_id=?",
+            (int(FAUCET_AMOUNT), t, interaction.user.id),
+        )
+        set_last_claim_at(con, interaction.user.id, t)
+
+        # Log (best effort)
+        try:
+            con.execute(
+                "INSERT INTO tx_log(ts, type, from_id, to_id, amount, note, status) VALUES(?,?,?,?,?,?,?)",
+                (t, "faucet_claim", None, interaction.user.id, int(FAUCET_AMOUNT), "faucet /claim", "ok"),
+            )
+        except Exception:
+            pass
+
+        row = con.execute("SELECT balance FROM users WHERE discord_id=?", (interaction.user.id,)).fetchone()
+        if row and row[0] is not None:
+            new_bal = int(row[0])
+
+        con.execute("COMMIT;")
+
+    except Exception:
+        try:
+            con.execute("ROLLBACK;")
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+    # Optional public announcement
+    if PUBLIC_CLAIM_ANNOUNCEMENTS and interaction.channel is not None:
+        try:
+            extra = ""
+            if PUBLIC_CLAIM_SHOW_ADDRESS and to_addr:
+                extra = f" (addr {to_addr[:6]}…{to_addr[-6:]})"
+            await interaction.channel.send(
+                f"{interaction.user.mention} claimed **{int(FAUCET_AMOUNT)} HCC** into their TipBot balance!{extra}"
+            )
+        except Exception:
+            pass
+
+    bal_txt = f"Your TipBot balance is now **{new_bal} HCC**." if new_bal is not None else ""
+    await interaction.followup.send(
+        f"Claim successful ✅ Added **{int(FAUCET_AMOUNT)} HCC** to your internal balance.\n"
+        f"Withdraw anytime with `/hcc_withdraw <amount>` to your registered address (`{to_addr}`).\n"
+        f"{bal_txt}",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(
@@ -1331,13 +1499,21 @@ async def whoami(interaction: discord.Interaction):
                 except Exception:
                     deposit_addr = "(linked, but cannot reach backend)"
 
+        last_claim = get_last_claim_at(con, interaction.user.id)
+        if not last_claim or now_ts() >= last_claim + int(FAUCET_COOLDOWN_SECONDS):
+            faucet_cd = "ready ✅"
+        else:
+            rem = (last_claim + int(FAUCET_COOLDOWN_SECONDS)) - now_ts()
+            faucet_cd = f"~{fmt_duration_hms(rem)} remaining"
+
         await interaction.response.send_message(
             f"HCC withdraw address: `{withdraw_addr}`\n"
             f"HCC website source: `{deposit_addr}`\n"
             f"VECO deposit address: `{(u.get('veco_deposit_address') or '(not created)')}`\n"
             f"Balances: **{u['balance']} HCC** | **{format_sat_to_veco(int(u.get('veco_internal_sat') or 0))} VECO**\n"
             f"HCC withdraw today: `{wd}/{MAX_WITHDRAW_PER_DAY}`\n"
-            f"HCC cooldown: `{WITHDRAW_COOLDOWN}s` | HCC min withdraw: `{MIN_WITHDRAW}`\n",
+            f"HCC cooldown: `{WITHDRAW_COOLDOWN}s` | HCC min withdraw: `{MIN_WITHDRAW}`\n"
+            f"Faucet claim: {faucet_cd}\n",
             ephemeral=True,
         )
     finally:
