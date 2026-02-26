@@ -483,6 +483,7 @@ def set_withdrawn_today(con: sqlite3.Connection, discord_id: int, dk: str, val: 
         (int(val), discord_id, dk)
     )
 
+
 # Faucet cooldown helpers
 def get_last_claim_at(con: sqlite3.Connection, discord_id: int) -> int:
     row = con.execute(
