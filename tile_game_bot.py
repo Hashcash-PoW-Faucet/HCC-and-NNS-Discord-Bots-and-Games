@@ -33,11 +33,13 @@ COMPLETION_COOLDOWN_SECONDS = int(os.getenv("TILE_GAME_COMPLETION_COOLDOWN_SECON
 # State helpers
 # ==========================
 
+
 def can_start_new_game(state: Dict[str, Any], now_ts: Optional[int] = None) -> bool:
     """Return True if we are allowed to spawn a new board (no active completion cooldown)."""
     now_ts = int(now_ts or time.time())
     pause_until = int(state.get("completion_cooldown_until", 0) or 0)
     return pause_until <= now_ts
+
 
 # Reward distribution:
 # payout (HCC) : number of tiles
@@ -126,6 +128,11 @@ def build_new_game_state(channel_id: int) -> Dict[str, Any]:
 
 
 def is_game_expired(game: Dict[str, Any], now_ts: Optional[int] = None) -> bool:
+    """Return True if the board has exceeded the configured lifetime.
+    If GAME_DURATION_SECONDS <= 0, time-based expiration is disabled.
+    """
+    if GAME_DURATION_SECONDS <= 0:
+        return False
     now_ts = int(now_ts or time.time())
     start = int(game.get("created_at", now_ts))
     return (now_ts - start) >= int(GAME_DURATION_SECONDS)
@@ -277,7 +284,7 @@ class TileGameBot:
             "- 2 tiles: **8 Ħ**\n"
             "- 1 tile: **16 Ħ**\n\n"
             f"Each player has a **{PLAYER_COOLDOWN_SECONDS // 60} min** cooldown between clicks.\n"
-            f"This board expires after **{GAME_DURATION_SECONDS // 3600} hours** or when all tiles are gone."
+            # f"This board expires after **{GAME_DURATION_SECONDS // 3600} hours** or when all tiles are gone."
         )
 
         embed = discord.Embed(title=title, description=desc)
@@ -301,15 +308,15 @@ class TileGameBot:
 
     async def reset_game_if_needed(self) -> None:
         """\
-        Check current game; if expired or all tiles claimed, delete old message (best-effort).
-        If the board was fully cleared (all tiles claimed), start a cooldown window before
-        spawning the next board.
+        Periodically check whether the current game is finished and, if so, run a
+        cooldown _without_ deleting the board message. After the cooldown, reuse
+        the same message for the next round.
         """
         state = load_state()
         game = state.get("current_game")
         now = int(time.time())
 
-        # No active game: only start a new one if we are past the completion cooldown.
+        # No game stored yet: only start a new one if we are past any cooldown.
         if not game or not isinstance(game, dict):
             if not can_start_new_game(state, now_ts=now):
                 return
@@ -319,35 +326,119 @@ class TileGameBot:
         expired = is_game_expired(game, now_ts=now)
         completed = all_tiles_claimed(game)
 
+        # If the board is still active (not expired, not completed), do nothing.
         if not expired and not completed:
-            # Still active
             return
 
-        # Try to delete old message (best-effort)
         channel_id = int(game.get("channel_id") or 0)
         message_id = int(game.get("message_id") or 0)
-        if channel_id and message_id:
-            try:
-                channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
-                msg = await channel.fetch_message(message_id)
-                await msg.delete()
-            except Exception:
-                # Old message might already be gone
-                pass
-
-        # Clear current game and, if completed, set completion cooldown
-        state["current_game"] = None
-        if completed and COMPLETION_COOLDOWN_SECONDS > 0:
-            state["completion_cooldown_until"] = now + int(COMPLETION_COOLDOWN_SECONDS)
-        else:
-            state["completion_cooldown_until"] = 0
-        save_state(state)
-
-        # Only spawn a new board immediately if we are not in completion cooldown
-        if not can_start_new_game(state, now_ts=int(time.time())):
+        if not channel_id or not message_id:
             return
 
-        await self.create_new_game_message()
+        try:
+            channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
+            msg = await channel.fetch_message(message_id)
+        except Exception:
+            # If we cannot fetch the message, bail out silently.
+            return
+
+        # If the board was completed, we want to keep it visible and show a cooldown.
+        if completed:
+            cooldown_until = int(state.get("completion_cooldown_until", 0) or 0)
+
+            # First time we notice completion: start cooldown and update the embed
+            if cooldown_until == 0 and COMPLETION_COOLDOWN_SECONDS > 0:
+                cooldown_until = now + int(COMPLETION_COOLDOWN_SECONDS)
+                state["completion_cooldown_until"] = cooldown_until
+                save_state(state)
+
+            # If cooldown is still running, update the message to show the next-round time.
+            if cooldown_until > now:
+                # Build an embed similar to the normal board, but with extra info.
+                game_id = game.get("game_id")
+                remaining = get_remaining_tiles(game)
+
+                title = f"🎰 HashCash Tile Game – Round #{game_id}"
+                desc = (
+                    "Click a tile to reveal a random HCC reward.\n\n"
+                    "- 6 tiles: **1 Ħ**\n"
+                    "- 4 tiles: **2 Ħ**\n"
+                    "- 3 tiles: **4 Ħ**\n"
+                    "- 2 tiles: **8 Ħ**\n"
+                    "- 1 tile: **16 Ħ**\n\n"
+                    f"Each player has a **{PLAYER_COOLDOWN_SECONDS // 60} min** cooldown between clicks.\n"
+                    f"This board has been fully cleared.\n"
+                )
+
+                # Discord timestamp helper: show relative and absolute time.
+                ts_rel = f"<t:{cooldown_until}:R>"
+                ts_abs = f"<t:{cooldown_until}:f>"
+                desc += f"\n⏳ Next round starts {ts_rel} ({ts_abs})."
+
+                embed = discord.Embed(title=title, description=desc)
+                embed.add_field(
+                    name="Tiles remaining",
+                    value=f"{remaining} / {TOTAL_TILES}",
+                    inline=False,
+                )
+
+                # Rebuild the view from state – all tiles are now disabled with amounts.
+                state = load_state()
+                view = TileGameView(self, state)
+                try:
+                    await msg.edit(embed=embed, view=view)
+                except Exception:
+                    pass
+                return
+
+            # Cooldown over: reset the board on the SAME message.
+            if 0 < cooldown_until <= now and can_start_new_game(state, now_ts=now):
+                # Build fresh state (new tiles, new game_id) but reuse channel/message IDs.
+                new_state = build_new_game_state(channel_id)
+                new_game = new_state.get("current_game") or {}
+                new_game["message_id"] = message_id
+                new_game["channel_id"] = channel_id
+                new_state["current_game"] = new_game
+                new_state["completion_cooldown_until"] = 0
+                save_state(new_state)
+
+                new_game_id = new_game.get("game_id")
+                remaining = get_remaining_tiles(new_game)
+
+                title = f"🎰 HashCash Tile Game – Round #{new_game_id}"
+                desc = (
+                    "Click a tile to reveal a random HCC reward.\n\n"
+                    "- 6 tiles: **1 Ħ**\n"
+                    "- 4 tiles: **2 Ħ**\n"
+                    "- 3 tiles: **4 Ħ**\n"
+                    "- 2 tiles: **8 Ħ**\n"
+                    "- 1 tile: **16 Ħ**\n\n"
+                    f"Each player has a **{PLAYER_COOLDOWN_SECONDS // 60} min** cooldown between clicks.\n"
+                    # f"This board expires after **{GAME_DURATION_SECONDS // 3600} hours** or when all tiles are gone."
+                )
+
+                embed = discord.Embed(title=title, description=desc)
+                embed.add_field(
+                    name="Tiles remaining",
+                    value=f"{remaining} / {TOTAL_TILES}",
+                    inline=False,
+                )
+
+                view = TileGameView(self, new_state)
+                try:
+                    await msg.edit(embed=embed, view=view)
+                except Exception as e:
+                    print(f"❌ Failed to start new tile game on existing message: {e}")
+                return
+
+            # If we get here, there is no active cooldown configured; do nothing.
+            return
+
+        # If the board simply expired (time-based) without being completed, we do not
+        # delete it anymore. We just leave it as-is and, if desired, a manual reset
+        # can clear the state file.
+        if expired and not completed:
+            return
 
     async def watchdog_loop(self) -> None:
         """
@@ -473,7 +564,7 @@ class TileGameBot:
             "- 2 tiles: **8 Ħ**\n"
             "- 1 tile: **16 Ħ**\n\n"
             f"Each player has a **{PLAYER_COOLDOWN_SECONDS // 60} min** cooldown between clicks.\n"
-            f"This board expires after **{GAME_DURATION_SECONDS // 3600} hours** or when all tiles are gone."
+            # f"This board expires after **{GAME_DURATION_SECONDS // 3600} hours** or when all tiles are gone."
         )
         embed = discord.Embed(title=title, description=desc)
         embed.add_field(name="Tiles remaining", value=f"{remaining} / {TOTAL_TILES}", inline=False)
