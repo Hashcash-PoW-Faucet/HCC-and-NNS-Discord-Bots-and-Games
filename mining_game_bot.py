@@ -35,6 +35,14 @@ OVERCLOCK_BOOST_PCT_GPU = float(os.getenv("OVERCLOCK_BOOST_PCT_GPU",  "20"))  # 
 OVERCLOCK_COST_ASIC = int(os.getenv("OVERCLOCK_COST_ASIC", "20"))
 OVERCLOCK_COST_GPU = int(os.getenv("OVERCLOCK_COST_GPU",  "10"))
 
+# --- Power Plant (extends Overclock duration) ---
+POWER_PLANT_MAX_LEVEL = int(os.getenv("POWER_PLANT_MAX_LEVEL", "3"))
+
+# Upgrade costs for levels 0->1, 1->2, 2->3 (override via .env if desired)
+POWER_PLANT_COST_L1 = int(os.getenv("POWER_PLANT_COST_L1", "100"))
+POWER_PLANT_COST_L2 = int(os.getenv("POWER_PLANT_COST_L2", "240"))
+POWER_PLANT_COST_L3 = int(os.getenv("POWER_PLANT_COST_L3", "360"))
+
 # Automatic pool payout: total Ħ paid out every interval (default: 60 Ħ / 4 hours)
 FACTORY_FILE = os.getenv("FACTORY_FILE", "mining_game_state.json").strip()
 if not FACTORY_FILE:
@@ -129,6 +137,38 @@ def overclock_remaining_seconds(dev: dict, now_ts: int) -> int:
         return max(0, int(until - int(now_ts or time.time())))
     except Exception:
         return 0
+
+
+def power_plant_level(rig: dict) -> int:
+    try:
+        lvl = int((rig or {}).get("power_plant_level", 0) or 0)
+    except Exception:
+        lvl = 0
+    return max(0, min(int(POWER_PLANT_MAX_LEVEL), lvl))
+
+
+def overclock_duration_seconds_for_rig(rig: dict) -> int:
+    """Compute OC duration based on Power Plant level.
+
+    Level 0: 24h (default)
+    Level 1: 48h
+    Level 2: 72h
+    Level 3: 96h
+    """
+    lvl = power_plant_level(rig)
+    return int(24 * 3600 * (1 + lvl))
+
+
+def power_plant_upgrade_cost(next_level: int) -> int:
+    next_level = int(next_level)
+    if next_level == 1:
+        return int(POWER_PLANT_COST_L1)
+    if next_level == 2:
+        return int(POWER_PLANT_COST_L2)
+    if next_level == 3:
+        return int(POWER_PLANT_COST_L3)
+    return int(POWER_PLANT_COST_L3)
+
 
 # --- TipBot DB helpers ---
 def db() -> sqlite3.Connection:
@@ -306,6 +346,20 @@ def fmt_duration_hms(seconds: int) -> str:
         return f"{d}d {h}h {m}m {s}s"
     return f"{h}h {m}m {s}s"
 
+
+def fmt_duration_days_only(seconds: int) -> str:
+    """Format long, fixed durations in whole days (e.g. 1d, 2d).
+
+    Intended for *static* durations like OC duration (24/48/72/96h), not countdowns.
+    Rounds to the nearest whole day.
+    """
+    seconds = max(0, int(seconds or 0))
+    if seconds < 86400:
+        # For sub-day static durations, show hours only
+        h = max(0, int(round(seconds / 3600.0)))
+        return f"{h}h"
+    d = max(1, int(round(seconds / 86400.0)))
+    return f"{d}d"
 
 # --- Helper: Next payout ETA in seconds ---
 def next_payout_eta_seconds(now_ts: int) -> int:
@@ -505,7 +559,7 @@ class MinerView(View):
     class OverclockAsicButton(Button):
         def __init__(self, row=None):
             disabled = (int(GAME_TREASURY_DISCORD_ID) == 0)
-            label = f"⚡ Overclock ASIC (24h, +{OVERCLOCK_BOOST_PCT_ASIC:.0f}%, {OVERCLOCK_COST_ASIC} Ħ)"
+            label = f"⚡ Overclock ASIC (+{OVERCLOCK_BOOST_PCT_ASIC:.0f}%, {OVERCLOCK_COST_ASIC} Ħ)"
             if disabled:
                 label = "⚡ Overclock ASIC (treasury not set)"
             super().__init__(
@@ -526,12 +580,13 @@ class MinerView(View):
                 await interaction.response.send_message("❌ You have no ASICs to overclock.", ephemeral=True)
                 return
             oc_view = SelectAsicOCView(view.user_id, view.miner_bot)
-            await interaction.response.send_message("Select an ASIC to overclock (24h boost):", view=oc_view, ephemeral=True)
+            dur = int(overclock_duration_seconds_for_rig(rig))
+            await interaction.response.send_message(f"Select an ASIC to overclock ({fmt_duration_days_only(dur)} boost):", view=oc_view, ephemeral=True)
 
     class OverclockGpuButton(Button):
         def __init__(self, row=None):
             disabled = (int(GAME_TREASURY_DISCORD_ID) == 0)
-            label = f"⚡ Overclock GPU (24h, +{OVERCLOCK_BOOST_PCT_GPU:.0f}%, {OVERCLOCK_COST_GPU} Ħ)"
+            label = f"⚡ Overclock GPU (+{OVERCLOCK_BOOST_PCT_GPU:.0f}%, {OVERCLOCK_COST_GPU} Ħ)"
             if disabled:
                 label = "⚡ Overclock GPU (treasury not set)"
             super().__init__(
@@ -552,16 +607,24 @@ class MinerView(View):
                 await interaction.response.send_message("❌ You have no GPUs to overclock.", ephemeral=True)
                 return
             oc_view = SelectGpuOCView(view.user_id, view.miner_bot)
-            await interaction.response.send_message("Select a GPU to overclock (24h boost):", view=oc_view, ephemeral=True)
+            dur = int(overclock_duration_seconds_for_rig(rig))
+            await interaction.response.send_message(f"Select a GPU to overclock ({fmt_duration_days_only(dur)} boost):", view=oc_view, ephemeral=True)
 
     def __init__(self, user_id, miner_bot, requester=None):
         super().__init__(timeout=None)
         self.user_id = int(user_id)
         self.miner_bot = miner_bot
         self.miner_bot.data = self.miner_bot.load_data()
+
         import discord.utils
         if discord.utils.get(self.children, custom_id="refresh") is None:
+            # Only the owner (or the original requester) should get interactive controls
             if requester is None or requester.id == self.user_id:
+                rig = self.miner_bot.get_user_rig(self.user_id)
+                if not rig or not isinstance(rig, dict):
+                    rig = {"rig_level": 1, "asics": [], "gpus": [], "upgrade_ready_time": None, "power_plant_level": 0}
+
+                # Core actions
                 self.add_item(self.RefreshButton(self.user_id, self.miner_bot, row=0))
                 self.add_item(self.BuyAsicButton(row=1))
                 self.add_item(self.BuyGpuButton(row=2))
@@ -569,11 +632,21 @@ class MinerView(View):
                 self.add_item(self.UpgradeGpuButton(row=2))
                 self.add_item(self.OverclockAsicButton(row=1))
                 self.add_item(self.OverclockGpuButton(row=2))
-                rig = self.miner_bot.get_user_rig(self.user_id)
-                current_level = rig.get("rig_level", 1)
+
+                # Rig upgrade button
+                current_level = int(rig.get("rig_level", 1) or 1)
                 upgrade_cost = int(RIG_BASE_BUILD_COST * (1.5 ** (current_level - 1)))
                 if current_level < MAX_RIG_LEVEL:
                     self.add_item(self.UpgradeRigButton(current_level, upgrade_cost, row=3))
+
+                # Power Plant upgrade button
+                ppl = power_plant_level(rig)
+                if ppl < int(POWER_PLANT_MAX_LEVEL):
+                    nxt = ppl + 1
+                    cost_pp = power_plant_upgrade_cost(nxt)
+                    # Show the *new* OC duration after upgrading to next level
+                    oc_dur_next = int(overclock_duration_seconds_for_rig({"power_plant_level": nxt}))
+                    self.add_item(self.UpgradePowerPlantButton(ppl, nxt, cost_pp, oc_dur_next, row=4))
 
     class UpgradeRigButton(Button):
         def __init__(self, current_level, upgrade_cost, row=None):
@@ -637,6 +710,63 @@ class MinerView(View):
                     await interaction.response.send_message("❌ Internal error during rig upgrade.", ephemeral=True)
                 except discord.errors.InteractionResponded:
                     pass
+
+    class UpgradePowerPlantButton(Button):
+        def __init__(self, current_level: int, next_level: int, cost: int, oc_dur_seconds: int, row=None):
+            disabled = (int(GAME_TREASURY_DISCORD_ID) == 0)
+            if disabled:
+                label = "🏭 Upgrade Power Plant (treasury not set)"
+            else:
+                label = f"🏭 Power Plant (Lvl {current_level} → {next_level}, OC {fmt_duration_days_only(oc_dur_seconds)}) – {cost} Ħ"
+            super().__init__(
+                label=label,
+                style=discord.ButtonStyle.gray if disabled else discord.ButtonStyle.blurple,
+                custom_id="upgrade_power_plant",
+                row=row,
+                disabled=disabled,
+            )
+
+        async def callback(self, interaction: discord.Interaction):
+            view: MinerView = self.view
+            if interaction.user.id != view.user_id:
+                await interaction.response.send_message("This is not your miner!", ephemeral=True)
+                return
+
+            if GAME_TREASURY_DISCORD_ID == 0:
+                await interaction.response.send_message("⚠️ Treasury not configured. Cannot upgrade.", ephemeral=True)
+                return
+
+            rig = view.miner_bot.get_user_rig(view.user_id)
+            if not rig or not isinstance(rig, dict):
+                await interaction.response.send_message("❌ Rig not found.", ephemeral=True)
+                return
+
+            cur = power_plant_level(rig)
+            if cur >= int(POWER_PLANT_MAX_LEVEL):
+                await interaction.response.send_message("🏭 Power Plant already at max level!", ephemeral=True)
+                return
+
+            nxt = cur + 1
+            cost = power_plant_upgrade_cost(nxt)
+            bal = get_user_balance(view.user_id)
+            if bal < cost:
+                await interaction.response.send_message("❌ Not enough Ħ to upgrade the Power Plant.", ephemeral=True)
+                return
+
+            ok = transfer_internal(view.user_id, GAME_TREASURY_DISCORD_ID, cost, note="upgrade power plant")
+            if not ok:
+                await interaction.response.send_message("❌ Still processing the previous action or insufficient funds.",
+                                                        ephemeral=True)
+                return
+
+            rig["power_plant_level"] = nxt
+            view.miner_bot.update_user_rig(view.user_id, rig)
+
+            dur = int(overclock_duration_seconds_for_rig(rig))
+            await interaction.response.send_message(
+                f"🏭 Power Plant upgraded to Level {nxt}! New OC duration: {fmt_duration_hms(dur)}.",
+                ephemeral=True,
+            )
 
 
 # --- ASIC Selection View ---
@@ -749,6 +879,7 @@ class SelectAsicOCView(discord.ui.View):
         self.rig = miner_bot.get_user_rig(self.user_id)
         self.balance = get_user_balance(self.user_id)
         now = int(time.time())
+        dur = int(overclock_duration_seconds_for_rig(self.rig))
 
         for idx, asic in enumerate((self.rig.get("asics", []) or [])):
             stars = int(asic.get("stars", 0) or 0)
@@ -761,7 +892,7 @@ class SelectAsicOCView(discord.ui.View):
 
             base = asic_raw_for_stars(stars)
             boosted = int(round(float(base) * (1.0 + (OVERCLOCK_BOOST_PCT_ASIC / 100.0))))
-            label = f"⚡ Overclock ASIC {idx+1} ({stars}⭐): {base} → {boosted} Gh/s · {OVERCLOCK_COST_ASIC} Ħ"
+            label = f"⚡ Overclock ASIC {idx + 1} ({stars}⭐): {base} → {boosted} Gh/s · {fmt_duration_days_only(dur)} · {OVERCLOCK_COST_ASIC} Ħ"
 
             style = discord.ButtonStyle.green if self.balance >= OVERCLOCK_COST_ASIC else discord.ButtonStyle.gray
             self.add_item(SelectAsicOCButton(idx, label, style, disabled=(self.balance < OVERCLOCK_COST_ASIC)))
@@ -808,10 +939,11 @@ class SelectAsicOCButton(discord.ui.Button):
             await interaction.response.send_message("❌ Still processing the previous action or insufficient funds.", ephemeral=True)
             return
 
-        asic["overclock_until"] = now + int(OVERCLOCK_DURATION_SECONDS)
+        dur = int(overclock_duration_seconds_for_rig(rig))
+        asic["overclock_until"] = now + dur
         view.miner_bot.update_user_rig(view.user_id, rig)
         await interaction.response.send_message(
-            f"⚡ ASIC overclocked! Boost +{OVERCLOCK_BOOST_PCT_ASIC:.0f}% for {fmt_duration_hms(int(OVERCLOCK_DURATION_SECONDS))}.",
+            f"⚡ ASIC overclocked! Boost +{OVERCLOCK_BOOST_PCT_ASIC:.0f}% for {fmt_duration_hms(dur)} (Power Plant Lvl {power_plant_level(rig)}).",
             ephemeral=True,
         )
 
@@ -916,6 +1048,7 @@ class SelectGpuOCView(discord.ui.View):
         self.rig = miner_bot.get_user_rig(self.user_id)
         self.balance = get_user_balance(self.user_id)
         now = int(time.time())
+        dur = int(overclock_duration_seconds_for_rig(self.rig))
 
         for idx, gpu in enumerate((self.rig.get("gpus", []) or [])):
             stars = int(gpu.get("stars", 0) or 0)
@@ -928,7 +1061,7 @@ class SelectGpuOCView(discord.ui.View):
 
             base = gpu_raw_for_stars(stars)
             boosted = int(round(float(base) * (1.0 + (OVERCLOCK_BOOST_PCT_GPU / 100.0))))
-            label = f"⚡ Overclock GPU {idx+1} ({stars}⭐): {base} → {boosted} Gh/s · {OVERCLOCK_COST_GPU} Ħ"
+            label = f"⚡ Overclock GPU {idx+1} ({stars}⭐): {base} → {boosted} Gh/s · {fmt_duration_days_only(dur)} · {OVERCLOCK_COST_GPU} Ħ"
 
             style = discord.ButtonStyle.green if self.balance >= OVERCLOCK_COST_GPU else discord.ButtonStyle.gray
             self.add_item(SelectGpuOCButton(idx, label, style, disabled=(self.balance < OVERCLOCK_COST_GPU)))
@@ -975,10 +1108,11 @@ class SelectGpuOCButton(discord.ui.Button):
             await interaction.response.send_message("❌ Still processing the previous action or insufficient funds.", ephemeral=True)
             return
 
-        gpu["overclock_until"] = now + int(OVERCLOCK_DURATION_SECONDS)
+        dur = int(overclock_duration_seconds_for_rig(rig))
+        gpu["overclock_until"] = now + dur
         view.miner_bot.update_user_rig(view.user_id, rig)
         await interaction.response.send_message(
-            f"⚡ GPU overclocked! Boost +{OVERCLOCK_BOOST_PCT_GPU:.0f}% for {fmt_duration_hms(int(OVERCLOCK_DURATION_SECONDS))}.",
+            f"⚡ GPU overclocked! Boost +{OVERCLOCK_BOOST_PCT_GPU:.0f}% for {fmt_duration_hms(dur)} (Power Plant Lvl {power_plant_level(rig)}).",
             ephemeral=True,
         )
 
@@ -1036,6 +1170,7 @@ class MinerGameBot:
                 rig = self.get_user_rig(user_id)
             if not rig:
                 view = discord.ui.View()
+
                 class BuildRigButton(discord.ui.Button):
                     def __init__(self, miner_bot):
                         disabled = (int(GAME_TREASURY_DISCORD_ID) == 0)
@@ -1060,6 +1195,7 @@ class MinerGameBot:
                         now = int(time.time())
                         new_rig = {
                             "rig_level": 1,
+                            "power_plant_level": 0,
                             "asics": [],
                             "gpus": [],
                             "upgrade_ready_time": None,
@@ -1073,6 +1209,9 @@ class MinerGameBot:
                 await interaction.followup.send("You don't own a miner rig yet. Would you like to build one?", view=view, ephemeral=True)
                 return
             self.data = self.load_data()
+            if isinstance(rig, dict) and "power_plant_level" not in rig:
+                rig["power_plant_level"] = 0
+                self.update_user_rig(user_id, rig)
             embed = self.create_miner_embed(rig, interaction.user.id)
             user_id = int(user_id)
             view = MinerView(user_id, self, requester=interaction.user)
@@ -1115,7 +1254,15 @@ class MinerGameBot:
         gpus = rig.get("gpus", [])
         max_gpus = MAX_GPUS_PER_LEVEL.get(rig.get("rig_level", 1), 1)
         embed.add_field(name="GPUs", value=f"{len(gpus)} / {max_gpus}", inline=True)
-        # --- Power (shown as effective share weight) ---
+        # --- Power Plant ---
+        ppl = power_plant_level(rig)
+        oc_dur = int(overclock_duration_seconds_for_rig(rig))
+        embed.add_field(
+            name="Power Plant",
+            value=f"Lvl {ppl} / {POWER_PLANT_MAX_LEVEL}\nOC duration: {fmt_duration_days_only(oc_dur)}",
+            inline=True
+        )
+        # --- Hash power (shown as effective share weight) ---
         raw = compute_raw_power(rig, now_ts=now)
         eff = compute_effective_power(raw)
         embed.add_field(name="Your in-game hashrate (Gh/s)", value=f"{eff:.2f}", inline=True)
