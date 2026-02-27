@@ -14,14 +14,26 @@ import time
 import sqlite3
 # from typing import Optional, Dict, Any, Tuple, List
 
-# --- MinerGame Constants (prices are placeholders; you will tune them later) ---
+# --- MinerGame Constants ---
 RIG_BASE_BUILD_COST = 10
 ASIC_COST = 45
 GPU_COST = 15
-MAX_RIG_LEVEL = 60
+MAX_RIG_LEVEL = 12
 MAX_ASICS_PER_LEVEL = {lvl: min(1 + (lvl - 1) * 1, 12) for lvl in range(1, MAX_RIG_LEVEL + 1)}
 MAX_GPUS_PER_LEVEL = {lvl: min(2 + (lvl - 1) * 2, 24) for lvl in range(1, MAX_RIG_LEVEL + 1)}
 BASE_UPGRADE_TIME_MINUTES = 60
+
+# --- Overclock (temporary boost) ---
+# Duration is fixed: 24h
+OVERCLOCK_DURATION_SECONDS = int(os.getenv("OVERCLOCK_DURATION_SECONDS", str(24 * 3600)))
+
+# Boost is a percentage applied multiplicatively to the device's raw contribution while active.
+OVERCLOCK_BOOST_PCT_ASIC = float(os.getenv("OVERCLOCK_BOOST_PCT_ASIC", "25"))  # e.g. 25 => +25%
+OVERCLOCK_BOOST_PCT_GPU = float(os.getenv("OVERCLOCK_BOOST_PCT_GPU",  "20"))  # e.g. 20 => +20%
+
+# Cost per device per overclock activation
+OVERCLOCK_COST_ASIC = int(os.getenv("OVERCLOCK_COST_ASIC", "20"))
+OVERCLOCK_COST_GPU = int(os.getenv("OVERCLOCK_COST_GPU",  "10"))
 
 # Automatic pool payout: total Ħ paid out every interval (default: 60 Ħ / 4 hours)
 FACTORY_FILE = os.getenv("FACTORY_FILE", "mining_game_state.json").strip()
@@ -85,6 +97,38 @@ def update_names_cache_for_user(user: discord.abc.User) -> None:
 def stars_to_multiplier(stars: int) -> float:
     return min(1.0 + 0.5 * math.log2(1 + stars), 5.0)
 
+
+def _clamp_float(x: float, lo: float, hi: float) -> float:
+    try:
+        v = float(x)
+    except Exception:
+        v = float(lo)
+    return max(float(lo), min(float(hi), v))
+
+
+def is_overclock_active(dev: dict, now_ts: int) -> bool:
+    try:
+        until = int(dev.get("overclock_until") or 0)
+        return until > int(now_ts or time.time())
+    except Exception:
+        return False
+
+
+def overclock_multiplier_for_device(dev: dict, now_ts: int, boost_pct: float) -> float:
+    if not dev or not isinstance(dev, dict):
+        return 1.0
+    if not is_overclock_active(dev, now_ts):
+        return 1.0
+    pct = _clamp_float(boost_pct, 0.0, 500.0)
+    return 1.0 + (pct / 100.0)
+
+
+def overclock_remaining_seconds(dev: dict, now_ts: int) -> int:
+    try:
+        until = int(dev.get("overclock_until") or 0)
+        return max(0, int(until - int(now_ts or time.time())))
+    except Exception:
+        return 0
 
 # --- TipBot DB helpers ---
 def db() -> sqlite3.Connection:
@@ -184,17 +228,26 @@ def credit_internal(to_id: int, amount: int, note: str) -> None:
         con.close()
 
 
-def compute_raw_power(rig: dict) -> int:
-    raw = 0
-    rig_level = rig.get("rig_level", 1)
-    raw += (rig_level - 1) * 10
-    for asic in rig.get("asics", []):
-        stars = asic.get("stars", 0)
-        raw += asic_raw_for_stars(stars)
-    for gpu in rig.get("gpus", []):
-        stars = gpu.get("stars", 0)
-        raw += gpu_raw_for_stars(stars)
-    return max(1, raw)
+def compute_raw_power(rig: dict, now_ts: int = None) -> int:
+    now_ts = int(now_ts or time.time())
+
+    raw = 0.0
+    rig_level = int(rig.get("rig_level", 1) or 1)
+    raw += max(0, (rig_level - 1)) * 10
+
+    for asic in rig.get("asics", []) or []:
+        stars = int(asic.get("stars", 0) or 0)
+        base = float(asic_raw_for_stars(stars))
+        mult = overclock_multiplier_for_device(asic, now_ts, OVERCLOCK_BOOST_PCT_ASIC)
+        raw += base * mult
+
+    for gpu in rig.get("gpus", []) or []:
+        stars = int(gpu.get("stars", 0) or 0)
+        base = float(gpu_raw_for_stars(stars))
+        mult = overclock_multiplier_for_device(gpu, now_ts, OVERCLOCK_BOOST_PCT_GPU)
+        raw += base * mult
+
+    return max(1, int(round(raw)))
 
 
 # --- Explicit per-device raw hashrate helpers ---
@@ -206,6 +259,7 @@ ASIC_RAW_TABLE = {
     4: 155,
     5: 200,
 }
+
 
 def asic_raw_for_stars(stars: int) -> int:
     """
@@ -317,11 +371,16 @@ class MinerView(View):
     class BuyAsicButton(Button):
         def __init__(self, row=None):
             extra_raw = asic_raw_for_stars(1)
+            disabled = (int(GAME_TREASURY_DISCORD_ID) == 0)
+            label = f"𒁈 Buy ASIC (+{extra_raw} Gh/s, {ASIC_COST} Ħ)"
+            if disabled:
+                label = "𒁈 Buy ASIC (treasury not set)"
             super().__init__(
-                label=f"𒁈 Buy ASIC (+{extra_raw} Gh/s, {ASIC_COST} Ħ)",
-                style=discord.ButtonStyle.primary,
+                label=label,
+                style=discord.ButtonStyle.gray if disabled else discord.ButtonStyle.primary,
                 custom_id="buy_asic",
                 row=row,
+                disabled=disabled,
             )
 
         async def callback(self, interaction: discord.Interaction):
@@ -348,18 +407,23 @@ class MinerView(View):
             if not ok:
                 await interaction.response.send_message("❌ Still processing the previous action or insufficient funds.", ephemeral=True)
                 return
-            rig.setdefault("asics", []).append({"stars": 1, "upgrade_ready_time": None})
+            rig.setdefault("asics", []).append({"stars": 1, "upgrade_ready_time": None, "overclock_until": None})
             view.miner_bot.update_user_rig(view.user_id, rig)
             await interaction.response.send_message("𒁈 ASIC bought and added to your rig!", ephemeral=True)
 
     class BuyGpuButton(Button):
         def __init__(self, row=None):
             extra_raw = gpu_raw_for_stars(1)
+            disabled = (int(GAME_TREASURY_DISCORD_ID) == 0)
+            label = f"🎮 Buy GPU (+{extra_raw} Gh/s, {GPU_COST} Ħ)"
+            if disabled:
+                label = "🎮 Buy GPU (treasury not set)"
             super().__init__(
-                label=f"🎮 Buy GPU (+{extra_raw} Gh/s, {GPU_COST} Ħ)",
-                style=discord.ButtonStyle.primary,
+                label=label,
+                style=discord.ButtonStyle.gray if disabled else discord.ButtonStyle.primary,
                 custom_id="buy_gpu",
                 row=row,
+                disabled=disabled,
             )
 
         async def callback(self, interaction: discord.Interaction):
@@ -386,13 +450,21 @@ class MinerView(View):
             if not ok:
                 await interaction.response.send_message("❌ Still processing the previous action or insufficient funds.", ephemeral=True)
                 return
-            rig.setdefault("gpus", []).append({"stars": 1, "upgrade_ready_time": None})
+            rig.setdefault("gpus", []).append({"stars": 1, "upgrade_ready_time": None, "overclock_until": None})
             view.miner_bot.update_user_rig(view.user_id, rig)
             await interaction.response.send_message("🎮 GPU bought and added to your rig!", ephemeral=True)
 
     class UpgradeAsicButton(Button):
         def __init__(self, row=None):
-            super().__init__(label="⭐ Upgrade ASIC", style=discord.ButtonStyle.gray, custom_id="upgrade_asic", row=row)
+            disabled = (int(GAME_TREASURY_DISCORD_ID) == 0)
+            label = "⭐ Upgrade ASIC" if not disabled else "⭐ Upgrade ASIC (treasury not set)"
+            super().__init__(
+                label=label,
+                style=discord.ButtonStyle.blurple if not disabled else discord.ButtonStyle.gray,
+                custom_id="upgrade_asic",
+                row=row,
+                disabled=disabled,
+            )
 
         async def callback(self, interaction: discord.Interaction):
             view: MinerView = self.view
@@ -408,7 +480,15 @@ class MinerView(View):
 
     class UpgradeGpuButton(Button):
         def __init__(self, row=None):
-            super().__init__(label="⚙️ Upgrade GPU", style=discord.ButtonStyle.gray, custom_id="upgrade_gpu", row=row)
+            disabled = (int(GAME_TREASURY_DISCORD_ID) == 0)
+            label = "⚙️ Upgrade GPU" if not disabled else "⚙️ Upgrade GPU (treasury not set)"
+            super().__init__(
+                label=label,
+                style=discord.ButtonStyle.blurple if not disabled else discord.ButtonStyle.gray,
+                custom_id="upgrade_gpu",
+                row=row,
+                disabled=disabled,
+            )
 
         async def callback(self, interaction: discord.Interaction):
             view: MinerView = self.view
@@ -421,6 +501,58 @@ class MinerView(View):
                 view=upgrade_view,
                 ephemeral=True
             )
+
+    class OverclockAsicButton(Button):
+        def __init__(self, row=None):
+            disabled = (int(GAME_TREASURY_DISCORD_ID) == 0)
+            label = f"⚡ Overclock ASIC (24h, +{OVERCLOCK_BOOST_PCT_ASIC:.0f}%, {OVERCLOCK_COST_ASIC} Ħ)"
+            if disabled:
+                label = "⚡ Overclock ASIC (treasury not set)"
+            super().__init__(
+                label=label,
+                style=discord.ButtonStyle.gray if disabled else discord.ButtonStyle.green,
+                custom_id="overclock_asic",
+                row=row,
+                disabled=disabled,
+            )
+
+        async def callback(self, interaction: discord.Interaction):
+            view: MinerView = self.view
+            if interaction.user.id != view.user_id:
+                await interaction.response.send_message("This is not your miner!", ephemeral=True)
+                return
+            rig = view.miner_bot.get_user_rig(view.user_id)
+            if not rig or not (rig.get("asics") or []):
+                await interaction.response.send_message("❌ You have no ASICs to overclock.", ephemeral=True)
+                return
+            oc_view = SelectAsicOCView(view.user_id, view.miner_bot)
+            await interaction.response.send_message("Select an ASIC to overclock (24h boost):", view=oc_view, ephemeral=True)
+
+    class OverclockGpuButton(Button):
+        def __init__(self, row=None):
+            disabled = (int(GAME_TREASURY_DISCORD_ID) == 0)
+            label = f"⚡ Overclock GPU (24h, +{OVERCLOCK_BOOST_PCT_GPU:.0f}%, {OVERCLOCK_COST_GPU} Ħ)"
+            if disabled:
+                label = "⚡ Overclock GPU (treasury not set)"
+            super().__init__(
+                label=label,
+                style=discord.ButtonStyle.gray if disabled else discord.ButtonStyle.green,
+                custom_id="overclock_gpu",
+                row=row,
+                disabled=disabled,
+            )
+
+        async def callback(self, interaction: discord.Interaction):
+            view: MinerView = self.view
+            if interaction.user.id != view.user_id:
+                await interaction.response.send_message("This is not your miner!", ephemeral=True)
+                return
+            rig = view.miner_bot.get_user_rig(view.user_id)
+            if not rig or not (rig.get("gpus") or []):
+                await interaction.response.send_message("❌ You have no GPUs to overclock.", ephemeral=True)
+                return
+            oc_view = SelectGpuOCView(view.user_id, view.miner_bot)
+            await interaction.response.send_message("Select a GPU to overclock (24h boost):", view=oc_view, ephemeral=True)
 
     def __init__(self, user_id, miner_bot, requester=None):
         super().__init__(timeout=None)
@@ -435,6 +567,8 @@ class MinerView(View):
                 self.add_item(self.BuyGpuButton(row=2))
                 self.add_item(self.UpgradeAsicButton(row=1))
                 self.add_item(self.UpgradeGpuButton(row=2))
+                self.add_item(self.OverclockAsicButton(row=1))
+                self.add_item(self.OverclockGpuButton(row=2))
                 rig = self.miner_bot.get_user_rig(self.user_id)
                 current_level = rig.get("rig_level", 1)
                 upgrade_cost = int(RIG_BASE_BUILD_COST * (1.5 ** (current_level - 1)))
@@ -443,11 +577,17 @@ class MinerView(View):
 
     class UpgradeRigButton(Button):
         def __init__(self, current_level, upgrade_cost, row=None):
+            disabled = (int(GAME_TREASURY_DISCORD_ID) == 0)
+            if disabled:
+                label = "🏗️ Upgrade Rig (treasury not set)"
+            else:
+                label = f"🏗️ Upgrade Rig (Lvl {current_level} → {current_level + 1}, +10 Gh/s, {upgrade_cost} Ħ)"
             super().__init__(
-                label=f"🏗️ Upgrade Rig (Lvl {current_level} → {current_level + 1}, +10 Gh/s, {upgrade_cost} Ħ)",
-                style=discord.ButtonStyle.blurple,
+                label=label,
+                style=discord.ButtonStyle.gray if disabled else discord.ButtonStyle.blurple,
                 custom_id="upgrade_rig",
-                row=row
+                row=row,
+                disabled=disabled,
             )
             self.upgrade_cost = upgrade_cost
 
@@ -599,6 +739,83 @@ class SelectAsicButton(discord.ui.Button):
                 await interaction.followup.send("❌ Internal error during ASIC upgrade.", ephemeral=True)
 
 
+# --- ASIC Overclock Selection View ---
+class SelectAsicOCView(discord.ui.View):
+    def __init__(self, user_id, miner_bot):
+        super().__init__(timeout=60)
+        self.user_id = int(user_id)
+        self.miner_bot = miner_bot
+        self.miner_bot.data = self.miner_bot.load_data()
+        self.rig = miner_bot.get_user_rig(self.user_id)
+        self.balance = get_user_balance(self.user_id)
+        now = int(time.time())
+
+        for idx, asic in enumerate((self.rig.get("asics", []) or [])):
+            stars = int(asic.get("stars", 0) or 0)
+
+            if is_overclock_active(asic, now):
+                rem = overclock_remaining_seconds(asic, now)
+                label = f"𒁈 ASIC {idx+1}: OC active ({fmt_duration_hms(rem)} left)"
+                self.add_item(SelectAsicOCButton(idx, label, discord.ButtonStyle.gray, disabled=True))
+                continue
+
+            base = asic_raw_for_stars(stars)
+            boosted = int(round(float(base) * (1.0 + (OVERCLOCK_BOOST_PCT_ASIC / 100.0))))
+            label = f"⚡ Overclock ASIC {idx+1} ({stars}⭐): {base} → {boosted} Gh/s · {OVERCLOCK_COST_ASIC} Ħ"
+
+            style = discord.ButtonStyle.green if self.balance >= OVERCLOCK_COST_ASIC else discord.ButtonStyle.gray
+            self.add_item(SelectAsicOCButton(idx, label, style, disabled=(self.balance < OVERCLOCK_COST_ASIC)))
+
+
+class SelectAsicOCButton(discord.ui.Button):
+    def __init__(self, asic_index: int, label: str, style: discord.ButtonStyle, disabled: bool = False):
+        super().__init__(label=label, style=style, custom_id=f"oc_asic_{asic_index}", disabled=disabled)
+        self.asic_index = int(asic_index)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: SelectAsicOCView = self.view
+        if interaction.user.id != view.user_id:
+            await interaction.response.send_message("This is not your miner!", ephemeral=True)
+            return
+
+        if GAME_TREASURY_DISCORD_ID == 0:
+            await interaction.response.send_message("⚠️ Treasury not configured. Cannot overclock.", ephemeral=True)
+            return
+
+        rig = view.miner_bot.get_user_rig(view.user_id)
+        now = int(time.time())
+        try:
+            asic = rig["asics"][self.asic_index]
+        except Exception:
+            await interaction.response.send_message("❌ ASIC not found.", ephemeral=True)
+            return
+
+        if is_overclock_active(asic, now):
+            rem = overclock_remaining_seconds(asic, now)
+            await interaction.response.send_message(
+                f"⚡ Overclock already active. Remaining: {fmt_duration_hms(rem)}.",
+                ephemeral=True
+            )
+            return
+
+        bal = get_user_balance(view.user_id)
+        if bal < OVERCLOCK_COST_ASIC:
+            await interaction.response.send_message("❌ Not enough Ħ to overclock this ASIC.", ephemeral=True)
+            return
+
+        ok = transfer_internal(view.user_id, GAME_TREASURY_DISCORD_ID, OVERCLOCK_COST_ASIC, note="overclock asic")
+        if not ok:
+            await interaction.response.send_message("❌ Still processing the previous action or insufficient funds.", ephemeral=True)
+            return
+
+        asic["overclock_until"] = now + int(OVERCLOCK_DURATION_SECONDS)
+        view.miner_bot.update_user_rig(view.user_id, rig)
+        await interaction.response.send_message(
+            f"⚡ ASIC overclocked! Boost +{OVERCLOCK_BOOST_PCT_ASIC:.0f}% for {fmt_duration_hms(int(OVERCLOCK_DURATION_SECONDS))}.",
+            ephemeral=True,
+        )
+
+
 # --- GPU Selection View ---
 class SelectGpuView(discord.ui.View):
     def __init__(self, user_id, miner_bot):
@@ -689,6 +906,82 @@ class SelectGpuButton(discord.ui.Button):
         )
 
 
+# --- GPU Overclock Selection View ---
+class SelectGpuOCView(discord.ui.View):
+    def __init__(self, user_id, miner_bot):
+        super().__init__(timeout=60)
+        self.user_id = int(user_id)
+        self.miner_bot = miner_bot
+        self.miner_bot.data = self.miner_bot.load_data()
+        self.rig = miner_bot.get_user_rig(self.user_id)
+        self.balance = get_user_balance(self.user_id)
+        now = int(time.time())
+
+        for idx, gpu in enumerate((self.rig.get("gpus", []) or [])):
+            stars = int(gpu.get("stars", 0) or 0)
+
+            if is_overclock_active(gpu, now):
+                rem = overclock_remaining_seconds(gpu, now)
+                label = f"🎮 GPU {idx+1}: OC active ({fmt_duration_hms(rem)} left)"
+                self.add_item(SelectGpuOCButton(idx, label, discord.ButtonStyle.gray, disabled=True))
+                continue
+
+            base = gpu_raw_for_stars(stars)
+            boosted = int(round(float(base) * (1.0 + (OVERCLOCK_BOOST_PCT_GPU / 100.0))))
+            label = f"⚡ Overclock GPU {idx+1} ({stars}⭐): {base} → {boosted} Gh/s · {OVERCLOCK_COST_GPU} Ħ"
+
+            style = discord.ButtonStyle.green if self.balance >= OVERCLOCK_COST_GPU else discord.ButtonStyle.gray
+            self.add_item(SelectGpuOCButton(idx, label, style, disabled=(self.balance < OVERCLOCK_COST_GPU)))
+
+
+class SelectGpuOCButton(discord.ui.Button):
+    def __init__(self, gpu_index: int, label: str, style: discord.ButtonStyle, disabled: bool = False):
+        super().__init__(label=label, style=style, custom_id=f"oc_gpu_{gpu_index}", disabled=disabled)
+        self.gpu_index = int(gpu_index)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: SelectGpuOCView = self.view
+        if interaction.user.id != view.user_id:
+            await interaction.response.send_message("This is not your miner!", ephemeral=True)
+            return
+
+        if GAME_TREASURY_DISCORD_ID == 0:
+            await interaction.response.send_message("⚠️ Treasury not configured. Cannot overclock.", ephemeral=True)
+            return
+
+        rig = view.miner_bot.get_user_rig(view.user_id)
+        now = int(time.time())
+        try:
+            gpu = rig["gpus"][self.gpu_index]
+        except Exception:
+            await interaction.response.send_message("❌ GPU not found.", ephemeral=True)
+            return
+
+        if is_overclock_active(gpu, now):
+            rem = overclock_remaining_seconds(gpu, now)
+            await interaction.response.send_message(
+                f"⚡ Overclock already active. Remaining: {fmt_duration_hms(rem)}.",
+                ephemeral=True
+            )
+            return
+
+        bal = get_user_balance(view.user_id)
+        if bal < OVERCLOCK_COST_GPU:
+            await interaction.response.send_message("❌ Not enough Ħ to overclock this GPU.", ephemeral=True)
+            return
+
+        ok = transfer_internal(view.user_id, GAME_TREASURY_DISCORD_ID, OVERCLOCK_COST_GPU, note="overclock gpu")
+        if not ok:
+            await interaction.response.send_message("❌ Still processing the previous action or insufficient funds.", ephemeral=True)
+            return
+
+        gpu["overclock_until"] = now + int(OVERCLOCK_DURATION_SECONDS)
+        view.miner_bot.update_user_rig(view.user_id, rig)
+        await interaction.response.send_message(
+            f"⚡ GPU overclocked! Boost +{OVERCLOCK_BOOST_PCT_GPU:.0f}% for {fmt_duration_hms(int(OVERCLOCK_DURATION_SECONDS))}.",
+            ephemeral=True,
+        )
+
 class MinerGameBot:
     DATA_FILE = FACTORY_FILE
 
@@ -745,7 +1038,11 @@ class MinerGameBot:
                 view = discord.ui.View()
                 class BuildRigButton(discord.ui.Button):
                     def __init__(self, miner_bot):
-                        super().__init__(label=f"⛏️ Build Miner Rig ({RIG_BASE_BUILD_COST} Ħ)", style=discord.ButtonStyle.success)
+                        disabled = (int(GAME_TREASURY_DISCORD_ID) == 0)
+                        label = f"⛏️ Build Miner Rig ({RIG_BASE_BUILD_COST} Ħ)"
+                        if disabled:
+                            label = "⛏️ Build Miner Rig (treasury not set)"
+                        super().__init__(label=label, style=discord.ButtonStyle.gray if disabled else discord.ButtonStyle.success, disabled=disabled)
                         self.miner_bot = miner_bot
 
                     async def callback(self, interaction: discord.Interaction):
@@ -819,7 +1116,7 @@ class MinerGameBot:
         max_gpus = MAX_GPUS_PER_LEVEL.get(rig.get("rig_level", 1), 1)
         embed.add_field(name="GPUs", value=f"{len(gpus)} / {max_gpus}", inline=True)
         # --- Power (shown as effective share weight) ---
-        raw = compute_raw_power(rig)
+        raw = compute_raw_power(rig, now_ts=now)
         eff = compute_effective_power(raw)
         embed.add_field(name="Your in-game hashrate (Gh/s)", value=f"{eff:.2f}", inline=True)
 
@@ -848,7 +1145,7 @@ class MinerGameBot:
                 rr = r
                 if apply_completed_upgrades(rr, now):
                     snap_users[uid] = rr
-                raw_i = compute_raw_power(rr)
+                raw_i = compute_raw_power(rr, now_ts=now)
                 eff_i = compute_effective_power(raw_i)
                 if eff_i > 0:
                     weights[str(uid)] = float(eff_i)
@@ -900,27 +1197,39 @@ class MinerGameBot:
         embed.add_field(name="Your TipBot balance", value=f"{balance} Ħ", inline=True)
 
         # --- Detailed per-device status (includes upgrade remaining time) ---
-        def _device_lines(devs, label_emoji: str, raw_func) -> str:
+        def _device_lines(devs, label_emoji: str, raw_func, boost_pct: float) -> str:
             if not devs:
                 return "None"
             lines = []
             for i, d in enumerate(devs, start=1):
                 stars = int(d.get("stars", 0) or 0)
-                raw_now = raw_func(stars)
+                base_raw = float(raw_func(stars))
+                mult = overclock_multiplier_for_device(d, now, boost_pct)
+                shown_raw = int(round(base_raw * mult))
+
+                oc_suffix = ""
+                if is_overclock_active(d, now):
+                    oc_rem = overclock_remaining_seconds(d, now)
+                    oc_suffix = f" · ⚡ OC +{boost_pct:.0f}% ({fmt_duration_hms(oc_rem)})"
+
                 uet = d.get("upgrade_ready_time")
                 if uet and int(uet) > now:
                     rem = int(uet - now)
-                    raw_next = raw_func(stars + 1)
+                    raw_next = float(raw_func(stars + 1))
+                    raw_next_shown = int(round(raw_next * mult))
                     lines.append(
-                        f"{label_emoji} #{i}: {stars}⭐ ({raw_now} Gh/s) → {stars + 1}⭐ ({raw_next} Gh/s) "
+                        f"{label_emoji} #{i}: {stars}⭐ ({shown_raw} Gh/s){oc_suffix} → {stars + 1}⭐ ({raw_next_shown} Gh/s) "
                         f"(ready in {fmt_duration_hms(rem)})"
                     )
                 else:
-                    lines.append(f"{label_emoji} #{i}: {stars}⭐ ({raw_now} Gh/s)")
+                    lines.append(f"{label_emoji} #{i}: {stars}⭐ ({shown_raw} Gh/s){oc_suffix}")
             return "\n".join(lines)
 
-        embed.add_field(name="ASIC status", value=_device_lines(asics, "𒁈 ASIC", asic_raw_for_stars), inline=False)
-        embed.add_field(name="GPU status", value=_device_lines(gpus, "🎮 GPU", gpu_raw_for_stars), inline=False)
+        embed.add_field(name="ASIC status",
+                        value=_device_lines(asics, "𒁈 ASIC", asic_raw_for_stars, OVERCLOCK_BOOST_PCT_ASIC),
+                        inline=False)
+        embed.add_field(name="GPU status",
+                        value=_device_lines(gpus, "🎮 GPU", gpu_raw_for_stars, OVERCLOCK_BOOST_PCT_GPU), inline=False)
         return embed
 
     async def _run_interval_payout_once(self, now_ts: int) -> None:
@@ -948,7 +1257,7 @@ class MinerGameBot:
             if apply_completed_upgrades(rig, now_ts):
                 users[uid] = rig
 
-            raw = compute_raw_power(rig)
+            raw = compute_raw_power(rig, now_ts=now_ts)
             eff = compute_effective_power(raw)
             if eff > 0:
                 weights[uid] = float(eff)
