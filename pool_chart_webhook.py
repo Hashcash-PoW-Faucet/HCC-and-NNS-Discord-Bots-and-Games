@@ -140,7 +140,7 @@ def invert_swap(
         old_h = h_after + aout
         return old_h, old_v
 
-    # Unbekannte Paare: nichts ändern
+    # Unknown pairs: do not change anything
     return h_after, v_after
 
 
