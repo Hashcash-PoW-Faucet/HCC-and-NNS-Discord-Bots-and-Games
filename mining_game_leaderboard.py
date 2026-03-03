@@ -20,6 +20,7 @@ TITLE = os.getenv("LEADERBOARD_TITLE", "⛏️ Discord Mining Game Leaderboard")
 # Duration is fixed in the game; leaderboard only needs the boost percentages.
 OVERCLOCK_BOOST_PCT_ASIC = float(os.getenv("OVERCLOCK_BOOST_PCT_ASIC", "25"))  # e.g. 25 => +25%
 OVERCLOCK_BOOST_PCT_GPU = float(os.getenv("OVERCLOCK_BOOST_PCT_GPU", "20"))    # e.g. 20 => +20%
+OVERCLOCK_BOOST_PCT_CPU = float(os.getenv("OVERCLOCK_BOOST_PCT_CPU", "35"))
 
 # --- Power Plant (extends Overclock duration) ---
 POWER_PLANT_MAX_LEVEL = int(os.getenv("POWER_PLANT_MAX_LEVEL", "3"))
@@ -88,6 +89,9 @@ def count_active_overclocks(rig: Dict[str, Any], now_ts: int) -> int:
         if isinstance(dev, dict) and is_overclock_active(dev, now_ts):
             n += 1
     for dev in (rig.get("gpus", []) or []):
+        if isinstance(dev, dict) and is_overclock_active(dev, now_ts):
+            n += 1
+    for dev in (rig.get("cpus", []) or []):
         if isinstance(dev, dict) and is_overclock_active(dev, now_ts):
             n += 1
     return n
@@ -165,12 +169,12 @@ def gpu_raw_for_stars(stars: int) -> int:
     return int(stars) * 10 + 10
 
 
-def compute_raw_power(rig: Dict[str, Any], now_ts: int = None) -> int:
+def compute_raw_power(rig: Dict[str, Any], now_ts: int = None) -> float:
     now_ts = int(now_ts or time.time())
 
     raw = 0.0
     rig_level = int(rig.get("rig_level", 1) or 1)
-    raw += (rig_level - 1) * 10
+    raw += max(0, (rig_level - 1)) * 10
 
     for asic in rig.get("asics", []) or []:
         stars = int(asic.get("stars", 0) or 0)
@@ -184,22 +188,22 @@ def compute_raw_power(rig: Dict[str, Any], now_ts: int = None) -> int:
         mult = overclock_multiplier_for_device(gpu, now_ts, OVERCLOCK_BOOST_PCT_GPU)
         raw += base * mult
 
-    return max(1, int(round(raw)))
+    for cpu in rig.get("cpus", []) or []:
+        base = 1.0
+        mult = overclock_multiplier_for_device(cpu, now_ts, OVERCLOCK_BOOST_PCT_CPU)
+        raw += base * mult
+
+    return max(1.0, float(raw))
 
 
-def compute_effective_power(raw_power: int) -> float:
+def compute_effective_power(raw_power: float) -> float:
     if EFFECTIVE_POWER_MODE == "sqrt":
         return math.sqrt(max(0, raw_power))
     return float(raw_power)
 
 
 def fmt_num(x: float) -> str:
-    s = f"{x:.2f}"
-    if s.endswith("00"):
-        return s[:-3]
-    if s.endswith("0"):
-        return s[:-1]
-    return s
+    return f"{x:.2f}"
 
 
 def load_names_cache(path: str) -> Dict[str, str]:
