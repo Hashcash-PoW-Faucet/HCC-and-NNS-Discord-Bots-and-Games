@@ -1267,6 +1267,113 @@ class SelectGpuOCButton(discord.ui.Button):
         )
 
 class MinerGameBot:
+    def build_help_embed(self, user: 'discord.abc.User | None' = None) -> 'discord.Embed':
+        # Local import to avoid circular issues
+        import discord
+        # Compute interval hours for payout pool
+        interval_hours = max(1, int(PAYOUT_INTERVAL_SECONDS) // 3600)
+        base_pool_line = f"Payout pool: up to {PAYOUT_TOTAL_PER_INTERVAL} Ħ every {interval_hours}h (funded from the game treasury)."
+        # Power Plant OC duration table
+        pp_lines = []
+        for lvl in range(0, POWER_PLANT_MAX_LEVEL + 1):
+            dummy_rig = {"power_plant_level": lvl}
+            dur = fmt_duration_days_only(overclock_duration_seconds_for_rig(dummy_rig))
+            pp_lines.append(f"Level {lvl}: OC duration {dur}")
+        pp_text = "\n".join(pp_lines)
+        embed = discord.Embed(
+            title="⛏️ Hashcash Miner Game – Help",
+            description=(
+                "Mini manual for the Hashcash Miner Game.\n"
+                "• Use `/miner` to open your rig.\n"
+                "• All balances and payments use your Ħ TipBot account."
+            )
+        )
+        # 1. Goal
+        embed.add_field(
+            name="Goal",
+            value=(
+                "Build and upgrade your virtual mining rig to increase your share of the payout pool. "
+                "Payouts are automatic and based on your effective hashrate."
+            ),
+            inline=False
+        )
+        # 2. Getting started
+        embed.add_field(
+            name="Getting started",
+            value=(
+                "• Earn some Ħ either via the faucet or tips in the Hashcash TipBot or by IRL mining.\n"
+                f"• Run `/miner` and build your first rig (costs {RIG_BASE_BUILD_COST} Ħ).\n"
+                "• Use the buttons to buy ASICs, GPUs, or CPUs and start upgrading."
+            ),
+            inline=False
+        )
+        # 3. Rig & devices
+        embed.add_field(
+            name="Rig & devices",
+            value=(
+                "- Rig level adds base hashrate and increases max devices.\n"
+                "- ASICs: strong, more expensive, upgrades (1–5⭐) make them much stronger.\n"
+                "- GPUs: cheaper, more numerous, upgrades (1–5⭐) make them stronger.\n"
+                "- CPUs: 1 Gh/s units, very cheap, many allowed per rig."
+            ),
+            inline=False
+        )
+        # 4. Upgrades
+        embed.add_field(
+            name="Upgrades",
+            value=(
+                "ASIC/GPU upgrades (⭐) take time—upgrading keeps the old power until the timer finishes. "
+                "Rig level upgrades also use a timer; remaining time is shown in the rig view."
+            ),
+            inline=False
+        )
+        # 5. Overclock & Power Plant
+        embed.add_field(
+            name="Overclock & Power Plant",
+            value=(
+                "- Overclock temporarily boosts a single ASIC or GPU, or all CPUs at once.\n"
+                "- Each overclock costs Ħ and lasts for a fixed duration depending on Power Plant level.\n"
+                f"- The Power Plant increases OC duration and can be upgraded up to level {POWER_PLANT_MAX_LEVEL}.\n"
+                "\n"
+                "**Current OC durations:**\n"
+                f"{pp_text}"
+            ),
+            inline=False
+        )
+        # 6. Effective hashrate & payouts
+        embed.add_field(
+            name="Effective hashrate & payouts",
+            value=(
+                f"{base_pool_line}\n"
+                "Payouts are proportional to your raw in-game hashrate (Gh/s). "
+                "You can see your estimated share and next payout time in the `/miner` view."
+            ),
+            inline=False
+        )
+        # 7. Leaderboard
+        embed.add_field(
+            name="Leaderboard",
+            value=(
+                "You can see the current mining leaderboard in <#1470034003028611303>. "
+                "It is updated automatically every few minutes."
+            ),
+            inline=False
+        )
+        # 8. TipBot integration
+        embed.add_field(
+            name="TipBot integration",
+            value=(
+                "- Costs (buying/upgrading/overclocking) are paid from your TipBot balance.\n"
+                "- Payouts are credited to your TipBot balance from the game treasury.\n"
+                "- Use TipBot commands like `/balances`, `/tip` or `/withdraw` to manage your Ħ."
+                "- Use the TipBot command `/help` for more information or read the <#1460421512690536560>."
+            ),
+            inline=False
+        )
+        embed.set_footer(text=f"Hashcash Miner Game {MINER_GAME_VERSION} – use /miner to open your rig.")
+        if user is not None:
+            embed.set_author(name=str(getattr(user, "display_name", None) or getattr(user, "name", None) or getattr(user, "id", "")))
+        return embed
     DATA_FILE = FACTORY_FILE
 
     def __init__(self):
@@ -1337,6 +1444,12 @@ class MinerGameBot:
             await interaction.response.defer(ephemeral=True)
             self.data = self.load_data()
             await self.show_miner_overview(interaction)
+
+        @self.bot.tree.command(name="miner_help", description="Show help for the Hashcash Miner Game")
+        async def miner_help_command(interaction: discord.Interaction):
+            update_names_cache_for_user(interaction.user)
+            embed = self.build_help_embed(interaction.user)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
     async def show_miner_overview(self, interaction: discord.Interaction, rig=None):
         try:
@@ -1664,7 +1777,6 @@ class MinerGameBot:
 
         self.data["last_payout_slot"] = slot
         self.save_data()
-
 
     async def payout_daemon(self) -> None:
         """Sleep until the *next* payout boundary, then pay out immediately (no 60s polling drift)."""
