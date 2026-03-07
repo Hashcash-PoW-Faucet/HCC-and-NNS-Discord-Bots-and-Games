@@ -510,6 +510,7 @@ def has_pending_withdraw(con: sqlite3.Connection, discord_id: int) -> bool:
     ).fetchone()
     return bool(row)
 
+
 def has_pending_veco_withdraw(con: sqlite3.Connection, discord_id: int) -> bool:
     row = con.execute(
         "SELECT id FROM veco_withdrawals WHERE discord_id=? AND status='pending' ORDER BY id DESC LIMIT 1",
@@ -517,10 +518,10 @@ def has_pending_veco_withdraw(con: sqlite3.Connection, discord_id: int) -> bool:
     ).fetchone()
     return bool(row)
 
+
 # ---------------------------
 # AMM pool helpers
 # ---------------------------
-
 def get_pool(con: sqlite3.Connection) -> Dict[str, int]:
     row = con.execute("SELECT hcc_reserve, veco_reserve_sat, fee_bps, updated_at FROM amm_pool WHERE id=1").fetchone()
     if not row:
@@ -569,6 +570,7 @@ async def veco_rpc_call(method: str, params: Optional[List[Any]] = None) -> Any:
             if data.get("error"):
                 raise RuntimeError(f"VECO RPC error: {data['error']}")
             return data.get("result")
+
 
 # ---------------------------
 # Hashcash backend API calls (matches your FastAPI app.py)
