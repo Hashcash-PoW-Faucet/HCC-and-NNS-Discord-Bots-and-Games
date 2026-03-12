@@ -16,8 +16,15 @@ from mining_game_bot import transfer_internal, get_user_balance, GAME_TREASURY_D
 load_dotenv(override=True)
 
 # ---- Game config ----
-BOARD_SIZE = 5
-NUM_MINES = 6
+# Desktop preset: 5x5 board
+DESKTOP_ROWS = 5
+DESKTOP_COLS = 5
+DESKTOP_MINES = 6
+
+# Mobile-friendly preset: 5 rows x 4 columns
+MOBILE_ROWS = 5
+MOBILE_COLS = 4
+MOBILE_MINES = 5
 
 
 ENTRY_FEE_HCC = int(os.getenv("SWEEPER_ENTRY_FEE", "2"))
@@ -38,6 +45,8 @@ class SweeperGame:
     user_id: int
     created_at: int
     status: str  # "running", "cashed_out", "lost"
+    rows: int
+    cols: int
     mine_positions: Set[Tuple[int, int]]  # (row, col)
     revealed: Set[Tuple[int, int]]
     safe_reveals: int  # number of non-mine cells successfully opened
@@ -54,8 +63,11 @@ class SweeperGame:
         return (r, c) in self.mine_positions
 
     @staticmethod
-    def in_bounds(r: int, c: int) -> bool:
-        return 0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE
+    def in_bounds_static(r: int, c: int, rows: int, cols: int) -> bool:
+        return 0 <= r < rows and 0 <= c < cols
+
+    def in_bounds(self, r: int, c: int) -> bool:
+        return self.in_bounds_static(r, c, self.rows, self.cols)
 
     def adjacent_mines(self, r: int, c: int) -> int:
         cnt = 0
@@ -74,15 +86,17 @@ class SweeperGame:
 ACTIVE_GAMES: Dict[Tuple[int, int], SweeperGame] = {}
 
 
-def new_game_for_user(user_id: int) -> SweeperGame:
-    # Randomly place NUM_MINES unique mine positions in 5x5 board (all cells are playable)
-    cells = [(r, c) for r in range(BOARD_SIZE) for c in range(BOARD_SIZE)]
-    mines = set(random.sample(cells, NUM_MINES))
+def new_game_for_user(user_id: int, rows: int, cols: int, num_mines: int) -> SweeperGame:
+    # Randomly place num_mines unique mine positions in the given board
+    cells = [(r, c) for r in range(rows) for c in range(cols)]
+    mines = set(random.sample(cells, num_mines))
 
     return SweeperGame(
         user_id=int(user_id),
         created_at=int(time.time()),
         status="running",
+        rows=int(rows),
+        cols=int(cols),
         mine_positions=mines,
         revealed=set(),
         safe_reveals=0,
@@ -102,9 +116,9 @@ class SweeperView(discord.ui.View):
         """Rebuild all buttons based on current game state."""
         self.clear_items()
 
-        # 5x5 board (all cells are playable)
-        for r in range(BOARD_SIZE):
-            for c in range(BOARD_SIZE):
+        # Board based on per-game rows/cols (can be 5x5 or 5x4)
+        for r in range(self.game.rows):
+            for c in range(self.game.cols):
                 custom_id = f"sweeper_{self.game.user_id}_{r}_{c}"
                 if self.game.status != "running":
                     disabled = True
@@ -169,7 +183,7 @@ class SweeperView(discord.ui.View):
             # --- First-click safety: ensure the very first click is never a mine ---
             if len(game.revealed) == 0 and game.safe_reveals == 0 and game.is_mine(r, c):
                 # Move the mine at (r, c) to a different, non-mine cell
-                all_cells = [(rr, cc) for rr in range(BOARD_SIZE) for cc in range(BOARD_SIZE)]
+                all_cells = [(rr, cc) for rr in range(game.rows) for cc in range(game.cols)]
                 candidates = [
                     cell
                     for cell in all_cells
@@ -186,8 +200,8 @@ class SweeperView(discord.ui.View):
                 game.status = "lost"
                 game.revealed.add((r, c))
                 # Optionally reveal all cells so the board is visible
-                for rr in range(BOARD_SIZE):
-                    for cc in range(BOARD_SIZE):
+                for rr in range(game.rows):
+                    for cc in range(game.cols):
                         game.revealed.add((rr, cc))
                 self.game = game
                 self.build_buttons()
@@ -202,7 +216,7 @@ class SweeperView(discord.ui.View):
             game.safe_reveals += 1
 
             # Check if all safe cells have been revealed
-            total_cells = BOARD_SIZE * BOARD_SIZE
+            total_cells = game.rows * game.cols
             total_safe = total_cells - len(game.mine_positions)
 
             if game.safe_reveals >= total_safe:
@@ -221,8 +235,8 @@ class SweeperView(discord.ui.View):
                         # If payout fails, leave the game state as won but inform the player
                         self.game = game
                         # Reveal full board for clarity
-                        for rr in range(BOARD_SIZE):
-                            for cc in range(BOARD_SIZE):
+                        for rr in range(game.rows):
+                            for cc in range(game.cols):
                                 game.revealed.add((rr, cc))
                         self.build_buttons()
                         await interaction.response.edit_message(
@@ -235,8 +249,8 @@ class SweeperView(discord.ui.View):
                         return
 
                 # Reveal full board and remove from active games
-                for rr in range(BOARD_SIZE):
-                    for cc in range(BOARD_SIZE):
+                for rr in range(game.rows):
+                    for cc in range(game.cols):
                         game.revealed.add((rr, cc))
                 self.game = game
                 self.build_buttons()
@@ -269,11 +283,14 @@ class SweeperView(discord.ui.View):
 class SweeperConfirmView(discord.ui.View):
     """Confirmation view before charging entry fee and starting a Sweeper game."""
 
-    def __init__(self, interaction: discord.Interaction):
+    def __init__(self, interaction: discord.Interaction, rows: int, cols: int, num_mines: int):
         super().__init__(timeout=60)
         self.interaction = interaction
         self.user_id = interaction.user.id
         self.guild_id = interaction.guild_id or 0
+        self.rows = int(rows)
+        self.cols = int(cols)
+        self.num_mines = int(num_mines)
 
         # Confirm button
         confirm_btn = discord.ui.Button(
@@ -357,15 +374,15 @@ class SweeperConfirmView(discord.ui.View):
             return
 
         # Create and store new game
-        game = new_game_for_user(self.user_id)
+        game = new_game_for_user(self.user_id, self.rows, self.cols, self.num_mines)
         ACTIVE_GAMES[key] = game
         view = SweeperView(game, self.guild_id)
 
         await interaction.response.edit_message(
             content=(
                 "🎮 **HCC Sweeper started!**\n"
-                f"- Board size: {BOARD_SIZE}×{BOARD_SIZE}\n"
-                f"- Mines: {NUM_MINES}\n"
+                f"- Board size: {self.rows}×{self.cols}\n"
+                f"- Mines: {self.num_mines}\n"
                 f"- Entry fee: {ENTRY_FEE_HCC} Ħ (paid)\n"
                 f"- Maximum possible reward: {MAX_REWARD_HCC} Ħ\n\n"
                 "Reveal safe cells one by one. If you clear **all** safe cells without hitting a mine, "
@@ -390,7 +407,7 @@ class SweeperConfirmView(discord.ui.View):
 
 
 # Register the sweeper command as a standalone app command
-@app_commands.command(name="sweeper", description="Play HCC Minesweeper (5x5)")
+@app_commands.command(name="sweeper_mobile", description="Play HCC Minesweeper (mobile 5x4)")
 async def sweeper_command(interaction: discord.Interaction):
     if interaction.guild_id is None:
         await interaction.response.send_message(
@@ -423,17 +440,72 @@ async def sweeper_command(interaction: discord.Interaction):
         return
 
     # Ask for confirmation before charging the entry fee
-    # max_reward_info = f"{MAX_REWARD_HCC} Ħ (capped)" if MAX_REWARD_HCC > 0 else "uncapped"
-
-    view = SweeperConfirmView(interaction)
+    view = SweeperConfirmView(
+        interaction,
+        rows=MOBILE_ROWS,
+        cols=MOBILE_COLS,
+        num_mines=MOBILE_MINES,
+    )
     await interaction.response.send_message(
         content=(
             "🎮 **Start HCC Sweeper?**\n"
-            f"- Board size: {BOARD_SIZE}×{BOARD_SIZE}\n"
-            f"- Mines: {NUM_MINES}\n"
+            f"- Board size: {MOBILE_ROWS}×{MOBILE_COLS}\n"
+            f"- Mines: {MOBILE_MINES}\n"
             f"- Entry fee: **{ENTRY_FEE_HCC} Ħ**\n"
             f"- Reward if you win: **{MAX_REWARD_HCC}**!\n\n"
-            # f"- Maximum possible reward: **{max_reward_info}**\n\n"
+            "Reveal safe cells one by one. If you clear **all** safe cells without hitting a mine, "
+            "you receive the final reward. If you hit a mine, the game ends immediately with **no payout**."
+        ),
+        view=view,
+        ephemeral=True,
+    )
+
+
+# Desktop sweeper command
+@app_commands.command(name="sweeper_desktop", description="Play HCC Minesweeper (desktop 5x5)")
+async def sweeper_desktop_command(interaction: discord.Interaction):
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "Sweeper can only be played in a server, not in DMs.",
+            ephemeral=True,
+        )
+        return
+
+    if GAME_TREASURY_DISCORD_ID == 0:
+        await interaction.response.send_message(
+            "Game treasury is not configured. Sweeper is temporarily disabled.",
+            ephemeral=True,
+        )
+        return
+
+    user_id = interaction.user.id
+    key = (interaction.guild_id, user_id)
+
+    existing = ACTIVE_GAMES.get(key)
+    if existing and existing.status == "running":
+        view = SweeperView(existing, interaction.guild_id)
+        await interaction.response.send_message(
+            content=(
+                "You already have a running Sweeper game.\n"
+            ),
+            view=view,
+            ephemeral=True,
+        )
+        return
+
+    view = SweeperConfirmView(
+        interaction,
+        rows=DESKTOP_ROWS,
+        cols=DESKTOP_COLS,
+        num_mines=DESKTOP_MINES,
+    )
+    await interaction.response.send_message(
+        content=(
+            "🎮 **Start HCC Sweeper (desktop mode)?**\n"
+            f"- Board size: {DESKTOP_ROWS}×{DESKTOP_COLS}\n"
+            f"- Mines: {DESKTOP_MINES}\n"
+            f"- Entry fee: **{ENTRY_FEE_HCC} Ħ**\n"
+            f"- Reward if you win: **{MAX_REWARD_HCC}**!\n\n"
             "Reveal safe cells one by one. If you clear **all** safe cells without hitting a mine, "
             "you receive the final reward. If you hit a mine, the game ends immediately with **no payout**."
         ),
@@ -478,8 +550,9 @@ class SweeperBot:
             except Exception as e:
                 print(f"⚠️ Failed to sync sweeper app commands: {e}")
 
-        # Attach the sweeper slash command to this bot's tree
+        # Attach the sweeper slash commands to this bot's tree
         self.bot.tree.add_command(sweeper_command)
+        self.bot.tree.add_command(sweeper_desktop_command)
         cmds = self.bot.tree.get_commands()
         print(f"[DEBUG] After add_command: {len(cmds)} app commands registered: {[cmd.name for cmd in cmds]}")
 

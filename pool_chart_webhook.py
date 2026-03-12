@@ -26,7 +26,8 @@ import sqlite3
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
+from urllib.parse import urlparse, parse_qsl, urlencode
 
 import requests
 from dotenv import load_dotenv
@@ -160,6 +161,7 @@ def load_message_id_from_state(state_path: Path) -> Optional[str]:
     return None
 
 
+
 def save_message_id_to_state(state_path: Path, message_id: str) -> None:
     try:
         state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -171,6 +173,66 @@ def save_message_id_to_state(state_path: Path, message_id: str) -> None:
         tmp.replace(state_path)
     except Exception:
         pass
+
+
+def build_webhook_base_and_query(webhook_url: str) -> Tuple[str, Dict[str, str]]:
+    parsed = urlparse((webhook_url or "").strip())
+    base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    return base, query
+
+
+
+def is_retryable_webhook_error(message: str) -> bool:
+    msg = (message or "").lower()
+    return (
+        " 429 " in f" {msg} "
+        or "rate limit" in msg
+        or "timeout" in msg
+        or "timed out" in msg
+        or "connection aborted" in msg
+        or "connection reset" in msg
+        or "temporarily unavailable" in msg
+        or " 500 " in f" {msg} "
+        or " 502 " in f" {msg} "
+        or " 503 " in f" {msg} "
+        or " 504 " in f" {msg} "
+    )
+
+
+
+def request_with_rate_limit_retry(
+    method: str,
+    url: str,
+    *,
+    params: Optional[Dict[str, str]] = None,
+    data: Optional[Dict[str, str]] = None,
+    files: Optional[Dict[str, Tuple[str, bytes, str]]] = None,
+    timeout: int = 30,
+) -> requests.Response:
+    last_response: Optional[requests.Response] = None
+    for attempt in range(2):
+        response = requests.request(method, url, params=params, data=data, files=files, timeout=timeout)
+        last_response = response
+        if response.status_code != 429:
+            return response
+
+        retry_after = response.headers.get("Retry-After", "").strip()
+        sleep_seconds = 1.5
+        try:
+            if retry_after:
+                sleep_seconds = max(0.5, float(retry_after))
+        except Exception:
+            sleep_seconds = 1.5
+
+        if attempt == 0:
+            time.sleep(min(sleep_seconds, 10.0))
+            continue
+        return response
+
+    if last_response is None:
+        raise RuntimeError("Discord request failed without response")
+    return last_response
 
 
 def build_spot_series(
@@ -286,7 +348,9 @@ def discord_webhook_post_or_patch(
     if not webhook_url:
         return False, "DISCORD_WEBHOOK_URL_CHART is empty"
 
-    params = {"wait": "true"}
+    base_url, query = build_webhook_base_and_query(webhook_url)
+    params = dict(query)
+    params["wait"] = "true"
     payload: dict = {"content": content}
 
     if not message_id:
@@ -306,11 +370,12 @@ def discord_webhook_post_or_patch(
 
     try:
         if message_id:
-            url = webhook_url.rstrip("/") + f"/messages/{message_id}"
-            r = requests.patch(url, params=params, data=data, files=files, timeout=30)
+            url = base_url + f"/messages/{message_id}"
+            print(f"Trying to edit pool chart webhook message_id={message_id}")
+            r = request_with_rate_limit_retry("PATCH", url, params=params, data=data, files=files, timeout=30)
         else:
-            url = webhook_url.rstrip("/")
-            r = requests.post(url, params=params, data=data, files=files, timeout=30)
+            url = base_url
+            r = request_with_rate_limit_retry("POST", url, params=params, data=data, files=files, timeout=30)
 
         txt = r.text or ""
         if r.status_code < 200 or r.status_code >= 300:
@@ -407,17 +472,20 @@ def main() -> int:
             avatar_url=avatar_url,
         )
 
-        if (not ok) and message_id and ("HTTP 404" in info or "Unknown Message" in info):
-            print("WARN: previous webhook message missing; posting a new one.")
-            message_id = None
-            ok, info = discord_webhook_post_or_patch(
-                webhook_url=webhook_url,
-                message_id=None,
-                png_bytes=png,
-                content=content,
-                username=username,
-                avatar_url=avatar_url,
-            )
+        if (not ok) and message_id:
+            if "HTTP 404" in info or "Unknown Message" in info:
+                print("WARN: previous webhook message missing; posting a new one.")
+                message_id = None
+                ok, info = discord_webhook_post_or_patch(
+                    webhook_url=webhook_url,
+                    message_id=None,
+                    png_bytes=png,
+                    content=content,
+                    username=username,
+                    avatar_url=avatar_url,
+                )
+            elif is_retryable_webhook_error(info):
+                print("WARN: temporary Discord/webhook failure; skipping repost to avoid duplicates.")
 
         print(("OK: " if ok else "ERROR: ") + info)
         if ok and info.startswith("posted_ok:"):

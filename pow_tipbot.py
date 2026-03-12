@@ -2419,10 +2419,26 @@ class ConfirmSwapView(discord.ui.View):
 
 
 
+
 @bot.tree.command(name="ui_swap", description="Open the swap UI (ephemeral).")
 async def swap_ui(interaction: discord.Interaction):
     view = SwapPanelView(interaction.user.id)
     await view.render(interaction, replace_message=False)
+
+
+@bot.tree.command(name="sawap", description="...")
+async def sawap(interaction: discord.Interaction):
+    gif_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "giphy-1.gif")
+
+    if not os.path.exists(gif_path):
+        await interaction.response.send_message(
+            "GIF file not found: `giphy-1.gif`",
+            ephemeral=True,
+        )
+        return
+
+    file = discord.File(gif_path, filename="giphy-1.gif")
+    await interaction.response.send_message(file=file, ephemeral=True)
 
 
 @bot.tree.command(name="swap", description="Swap between internal HCC (integer) and internal VECO (8 decimals).")

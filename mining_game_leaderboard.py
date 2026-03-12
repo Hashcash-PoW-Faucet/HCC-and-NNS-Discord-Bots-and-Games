@@ -3,7 +3,8 @@ import os
 import json
 import math
 import time
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
+from urllib.parse import urlparse, parse_qsl, urlencode
 from dotenv import load_dotenv
 import requests
 
@@ -322,9 +323,12 @@ def compute_leaderboard(state: Dict[str, Any], top_n: int, names_cache: Dict[str
 
 
 
-def _webhook_base_url(url: str) -> str:
-    # strip any query params, keep the base webhook URL
-    return (url or "").strip().split("?")[0]
+
+def _webhook_base_and_query(url: str) -> Tuple[str, Dict[str, str]]:
+    parsed = urlparse((url or "").strip())
+    base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    return base, query
 
 
 def _load_message_id(path: str) -> str:
@@ -339,15 +343,19 @@ def _load_message_id(path: str) -> str:
         return ""
 
 
+
 def _save_message_id(path: str, message_id: str) -> None:
     if not path:
         return
+    tmp = f"{path}.tmp"
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             f.write(str(message_id).strip())
+        os.replace(tmp, path)
     except Exception:
         # non-fatal
         pass
+
 
 
 def _build_webhook_payload(content: str) -> Dict[str, Any]:
@@ -364,28 +372,84 @@ def _build_webhook_payload(content: str) -> Dict[str, Any]:
     return payload
 
 
+def _is_retryable_webhook_error(message: str) -> bool:
+    msg = (message or "").lower()
+    return (
+        " 429 " in f" {msg} "
+        or "rate limit" in msg
+        or "timeout" in msg
+        or "timed out" in msg
+        or "connection aborted" in msg
+        or "connection reset" in msg
+        or "temporarily unavailable" in msg
+        or " 500 " in f" {msg} "
+        or " 502 " in f" {msg} "
+        or " 503 " in f" {msg} "
+        or " 504 " in f" {msg} "
+    )
+
+
+def _request_with_rate_limit_retry(method: str, url: str, payload: Dict[str, Any], timeout: int = 20) -> requests.Response:
+    last_response: Optional[requests.Response] = None
+    for attempt in range(2):
+        response = requests.request(method, url, json=payload, timeout=timeout)
+        last_response = response
+        if response.status_code != 429:
+            return response
+
+        retry_after = response.headers.get("Retry-After", "").strip()
+        sleep_seconds = 1.5
+        try:
+            if retry_after:
+                sleep_seconds = max(0.5, float(retry_after))
+        except Exception:
+            sleep_seconds = 1.5
+
+        if attempt == 0:
+            time.sleep(min(sleep_seconds, 10.0))
+            continue
+        return response
+
+    if last_response is None:
+        raise RuntimeError("webhook request failed without response")
+    return last_response
+
+
+
 def post_or_edit_webhook_message(webhook_url: str, content: str, message_id_file: str) -> None:
     """Edit the previous leaderboard message if possible; otherwise create a new one.
 
     Uses a local message-id file to remember which webhook message to edit next time.
     """
-    base_url = _webhook_base_url(webhook_url)
+    base_url, query = _webhook_base_and_query(webhook_url)
     payload = _build_webhook_payload(content)
 
     # Try to edit existing message
     msg_id = _load_message_id(message_id_file)
     if msg_id:
         edit_url = f"{base_url}/messages/{msg_id}"
-        r = requests.patch(edit_url, json=payload, timeout=20)
+        if query:
+            edit_url += "?" + urlencode(query)
+
+        print(f"Trying to edit mining leaderboard message_id={msg_id}")
+        r = _request_with_rate_limit_retry("PATCH", edit_url, payload, timeout=20)
         if r.status_code < 300:
             return
-        # If it fails (deleted / invalid), we fall back to creating a new message.
+
+        err_msg = f"webhook edit failed: {r.status_code} {r.text[:500]}"
+        print(err_msg)
+
+        # For temporary Discord/network problems, do not create duplicate messages.
+        if _is_retryable_webhook_error(err_msg):
+            raise RuntimeError(err_msg)
 
     # Create new message (wait=true returns message JSON incl. id)
-    create_url = f"{base_url}?wait=true"
-    r2 = requests.post(create_url, json=payload, timeout=20)
+    create_query = dict(query)
+    create_query["wait"] = "true"
+    create_url = base_url + "?" + urlencode(create_query)
+    r2 = _request_with_rate_limit_retry("POST", create_url, payload, timeout=20)
     if r2.status_code >= 300:
-        raise RuntimeError(f"Webhook failed: {r2.status_code} {r2.text}")
+        raise RuntimeError(f"Webhook failed: {r2.status_code} {r2.text[:500]}")
 
     # Save message id for next run
     try:

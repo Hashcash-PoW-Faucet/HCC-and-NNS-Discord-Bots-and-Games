@@ -4,6 +4,7 @@ import json
 import time
 import sqlite3
 import requests
+from urllib.parse import urlparse, parse_qsl, urlencode
 from typing import Optional, Dict, Any, Tuple
 
 try:
@@ -64,9 +65,37 @@ def save_state(st: Dict[str, Any]) -> None:
     os.replace(tmp, STATE_FILE)
 
 
+def build_webhook_base_and_query() -> Tuple[str, Dict[str, str]]:
+    """Split webhook URL into base path and query parameters."""
+    parsed = urlparse(WEBHOOK_URL)
+    base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    return base, query
+
+
+def is_retryable_webhook_error(message: str) -> bool:
+    """Return True for temporary webhook failures where we should not repost immediately."""
+    msg = (message or "").lower()
+    return (
+        " 429 " in f" {msg} "
+        or "rate limit" in msg
+        or "timeout" in msg
+        or "timed out" in msg
+        or "connection aborted" in msg
+        or "connection reset" in msg
+        or "temporarily unavailable" in msg
+        or " 500 " in f" {msg} "
+        or " 502 " in f" {msg} "
+        or " 503 " in f" {msg} "
+        or " 504 " in f" {msg} "
+    )
+
+
 def webhook_post(content: str) -> Optional[str]:
-    # Use ?wait=true to receive message object including id
-    url = WEBHOOK_URL + ("&" if "?" in WEBHOOK_URL else "?") + "wait=true"
+    base, query = build_webhook_base_and_query()
+    query["wait"] = "true"
+    url = base + "?" + urlencode(query)
+
     payload: Dict[str, Any] = {"content": content}
     if USERNAME:
         payload["username"] = USERNAME
@@ -75,7 +104,7 @@ def webhook_post(content: str) -> Optional[str]:
 
     r = requests.post(url, json=payload, timeout=20)
     if r.status_code // 100 != 2:
-        raise RuntimeError(f"webhook post failed: {r.status_code} {r.text[:200]}")
+        raise RuntimeError(f"webhook post failed: {r.status_code} {r.text[:500]}")
     try:
         msg = r.json()
         mid = str(msg.get("id") or "")
@@ -86,7 +115,11 @@ def webhook_post(content: str) -> Optional[str]:
 
 def webhook_edit(message_id: str, content: str) -> None:
     # webhook edit endpoint: {webhook_url}/messages/{message_id}
-    url = WEBHOOK_URL.rstrip("/") + f"/messages/{message_id}"
+    base, query = build_webhook_base_and_query()
+    url = base + f"/messages/{message_id}"
+    if query:
+        url += "?" + urlencode(query)
+
     payload: Dict[str, Any] = {"content": content}
     if USERNAME:
         payload["username"] = USERNAME
@@ -95,7 +128,7 @@ def webhook_edit(message_id: str, content: str) -> None:
 
     r = requests.patch(url, json=payload, timeout=20)
     if r.status_code // 100 != 2:
-        raise RuntimeError(f"webhook edit failed: {r.status_code} {r.text[:200]}")
+        raise RuntimeError(f"webhook edit failed: {r.status_code} {r.text[:500]}")
 
 
 def fmt_ts_rel(ts: int) -> str:
@@ -305,15 +338,28 @@ def main() -> None:
 
     try:
         if mid:
+            print(f"Trying to edit lottery webhook message_id={mid}")
             webhook_edit(mid, msg)
+            st["last_error"] = ""
+            save_state(st)
         else:
             new_id = webhook_post(msg)
             if new_id:
                 st["message_id"] = new_id
                 st["posted_at"] = now_unix()
+                st["last_error"] = ""
                 save_state(st)
     except Exception as e:
-        # If edit failed (message deleted, etc.), post new and overwrite state
+        err_msg = str(e)
+        print(f"Lottery webhook update failed for message_id={mid}: {err_msg}")
+        st["last_error"] = err_msg
+
+        # For temporary Discord/network problems, do not create duplicate messages.
+        if is_retryable_webhook_error(err_msg):
+            save_state(st)
+            raise
+
+        # If edit failed because the message is gone or invalid, post a new one and overwrite state.
         if mid:
             try:
                 new_id = webhook_post(msg)
@@ -323,8 +369,12 @@ def main() -> None:
                     st["last_error"] = ""
                     save_state(st)
                 return
-            except Exception:
-                pass
+            except Exception as post_err:
+                st["last_error"] = f"{err_msg} | fallback post failed: {post_err}"
+                save_state(st)
+                raise
+
+        save_state(st)
         raise
 
 

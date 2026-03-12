@@ -5,6 +5,7 @@ import time
 import sqlite3
 from typing import Dict, Any, List, Tuple, Optional
 from urllib.parse import urlparse, parse_qsl, urlencode
+
 from dotenv import load_dotenv
 import requests
 
@@ -13,36 +14,53 @@ load_dotenv()
 # ----------------------------
 # Config (env)
 # ----------------------------
-WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL_FAUCET", "").strip().strip('"').strip("'")
+
+# Webhook where the Sweeper leaderboard should be posted
+WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL_SWEEPER", "").strip().strip('"').strip("'")
+
+# TipBot DB (same DB as faucet / mining game)
 DB_PATH = os.getenv("TIPBOT_DB", "tipbot.db").strip()
 
-TOP_N = int(os.getenv("LEADERBOARD_TOP_N", "20"))
-TITLE = os.getenv("LEADERBOARD_TITLE", "🚰 HCC Faucet Leaderboard (All-Time)").strip()
+# Top-N users by number of wins
+TOP_N = int(os.getenv("SWEEPER_LEADERBOARD_TOP_N", "20"))
 
-# If 1: allow real pings. If 0: no pings, but mentions may still render as names depending on Discord.
-PING_USERS = os.getenv("LEADERBOARD_PING_USERS", "0").strip() == "1"
+TITLE = os.getenv(
+    "SWEEPER_LEADERBOARD_TITLE",
+    "💣 HCC Sweeper Leaderboard (Wins)"
+).strip()
 
-# Cache Discord-ID -> display name (so we can show usernames without live API calls)
-NAMES_CACHE_FILE = os.getenv("NAMES_CACHE_FILE", "names_cache.json").strip()
-MAX_NAME_LEN = int(os.getenv("LEADERBOARD_MAX_NAME_LEN", "22"))
+# If 1: allow real pings. If 0: no pings, only show mentions as text.
+PING_USERS = os.getenv("SWEEPER_LEADERBOARD_PING_USERS", "0").strip() == "1"
+
+# Cache Discord-ID -> display name (so we avoid live API lookups every time)
+NAMES_CACHE_FILE = os.getenv("SWEEPER_NAMES_CACHE_FILE", "names_cache_sweeper.json").strip()
+MAX_NAME_LEN = int(os.getenv("SWEEPER_LEADERBOARD_MAX_NAME_LEN", "22"))
 
 # Store last webhook message id so we can edit instead of reposting
-MESSAGE_ID_FILE = os.getenv("LEADERBOARD_MESSAGE_ID_FILE", "faucet_leaderboard_message_id.txt").strip()
+MESSAGE_ID_FILE = os.getenv(
+    "SWEEPER_LEADERBOARD_MESSAGE_ID_FILE",
+    "sweeper_leaderboard_message_id.txt"
+).strip()
 
-# Optional: resolve usernames via Discord API (fills/updates cache)
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()  # reuse your bot token if you want
-GUILD_ID = os.getenv("GUILD_ID", "").strip()  # optional: enables guild nickname lookup
+# Optional: resolve usernames via Discord API (guild nick > global name)
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_TOKEN_SWEEPER", "").strip()  # can also reuse main bot token
+GUILD_ID = os.getenv("SWEEPER_GUILD_ID", "").strip()  # optional: for guild nicknames
 
 
 # ----------------------------
-# Helpers
+# DB helper
 # ----------------------------
+
 def db() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
     con.execute("PRAGMA journal_mode=WAL;")
     con.execute("PRAGMA synchronous=NORMAL;")
     return con
 
+
+# ----------------------------
+# Names cache helpers
+# ----------------------------
 
 def load_names_cache(path: str) -> Dict[str, str]:
     if not path or not os.path.exists(path):
@@ -82,9 +100,13 @@ def shorten_name(name: str) -> str:
 
 
 def fmt_int(n: int) -> str:
-    # simple thousands separator
+    """Simple thousands separator with dots."""
     return f"{int(n):,}".replace(",", ".")
 
+
+# ----------------------------
+# Webhook helpers
+# ----------------------------
 
 def _webhook_base_and_query(url: str) -> Tuple[str, Dict[str, str]]:
     parsed = urlparse((url or "").strip())
@@ -177,7 +199,7 @@ def post_or_edit_webhook_message(webhook_url: str, content: str, message_id_file
         if query:
             edit_url += "?" + urlencode(query)
 
-        print(f"Trying to edit faucet leaderboard message_id={msg_id}")
+        print(f"Trying to edit sweeper leaderboard message_id={msg_id}")
         r = _request_with_rate_limit_retry("PATCH", edit_url, payload, timeout=20)
         if r.status_code < 300:
             return
@@ -208,6 +230,7 @@ def post_or_edit_webhook_message(webhook_url: str, content: str, message_id_file
 # ----------------------------
 # Discord name resolving (optional)
 # ----------------------------
+
 def _discord_api_get(url: str) -> Optional[dict]:
     if not DISCORD_BOT_TOKEN:
         return None
@@ -222,12 +245,12 @@ def _discord_api_get(url: str) -> Optional[dict]:
 
 
 def resolve_display_name(discord_id: str) -> Optional[str]:
-    """Try to resolve a friendly display name via Discord API (guild nick > global username)."""
+    """Resolve a friendly display name via Discord API (guild nick > global username)."""
     did = str(discord_id).strip()
     if not did.isdigit():
         return None
 
-    # 1) Guild member (preferred) -> nick or user.global_name/username
+    # 1) Guild member (preferred)
     if GUILD_ID and GUILD_ID.isdigit():
         mem = _discord_api_get(f"https://discord.com/api/v10/guilds/{GUILD_ID}/members/{did}")
         if isinstance(mem, dict):
@@ -243,7 +266,7 @@ def resolve_display_name(discord_id: str) -> Optional[str]:
                 if un:
                     return un
 
-    # 2) User object (no guild nick)
+    # 2) Fallback: user object
     u2 = _discord_api_get(f"https://discord.com/api/v10/users/{did}")
     if isinstance(u2, dict):
         gn = (u2.get("global_name") or "").strip()
@@ -252,84 +275,126 @@ def resolve_display_name(discord_id: str) -> Optional[str]:
         un = (u2.get("username") or "").strip()
         if un:
             return un
-
     return None
 
 
 # ----------------------------
 # Leaderboard logic
 # ----------------------------
-def fetch_faucet_leaderboard(con: sqlite3.Connection, top_n: int) -> List[Tuple[int, int, int]]:
+
+def fetch_sweeper_leaderboard(con: sqlite3.Connection, top_n: int) -> List[Tuple[int, int]]:
     """
-    Returns rows: [(discord_id, total_claimed, claim_count), ...] sorted by total_claimed desc
-    Uses tx_log entries created by /claim:
-      type='faucet_claim', to_id=<discord_id>, amount=<FAUCET_AMOUNT>, status='ok'
+    Returns rows: [(discord_id, win_count), ...] sorted by win_count desc.
+
+    We detect Sweeper wins via tx_log entries created in transfer_internal with:
+      type='game', status='ok', note LIKE 'Sweeper win%'
+      and to_id = <winner discord_id>
     """
     q = """
     SELECT
       to_id AS discord_id,
-      COALESCE(SUM(amount), 0) AS total_claimed,
-      COUNT(*) AS claim_count
+      COUNT(*) AS wins
     FROM tx_log
-    WHERE type='faucet_claim' AND status='ok' AND to_id IS NOT NULL
+    WHERE
+      type='game'
+      AND status='ok'
+      AND to_id IS NOT NULL
+      AND note LIKE 'Sweeper win%%'
     GROUP BY to_id
-    ORDER BY total_claimed DESC
+    ORDER BY wins DESC
     LIMIT ?
     """
-    out: List[Tuple[int, int, int]] = []
+    out: List[Tuple[int, int]] = []
     for row in con.execute(q, (int(top_n),)).fetchall():
         try:
             did = int(row[0])
-            total = int(row[1] or 0)
-            cnt = int(row[2] or 0)
+            wins = int(row[1] or 0)
         except Exception:
             continue
-        out.append((did, total, cnt))
+        out.append((did, wins))
     return out
 
+def fetch_sweeper_global_stats(con: sqlite3.Connection) -> Tuple[int, int]:
+    """
+    Return (total_games, total_wins) across all players.
 
-def build_table(rows: List[Tuple[str, int, int]]) -> str:
+    We detect games via tx_log entries created in transfer_internal with:
+      - game played: type='game', status='ok', note LIKE 'Sweeper entry fee%'
+      - game won:    type='game', status='ok', note LIKE 'Sweeper win%'
     """
-    rows: [(name, total_claimed, claim_count)]
+    # Total games started (entry fees charged)
+    q_games = """
+    SELECT COUNT(*) AS cnt
+    FROM tx_log
+    WHERE
+      type='game'
+      AND status='ok'
+      AND note LIKE 'Sweeper entry fee%%'
     """
-    prepared: List[Tuple[str, str, str, str]] = []
-    for i, (name, total, cnt) in enumerate(rows, start=1):
+    # Total wins
+    q_wins = """
+    SELECT COUNT(*) AS cnt
+    FROM tx_log
+    WHERE
+      type='game'
+      AND status='ok'
+      AND note LIKE 'Sweeper win%%'
+    """
+    cur = con.cursor()
+
+    try:
+        row_games = cur.execute(q_games).fetchone()
+        row_wins = cur.execute(q_wins).fetchone()
+
+        total_games = int(row_games[0] or 0) if row_games else 0
+        total_wins = int(row_wins[0] or 0) if row_wins else 0
+        return total_games, total_wins
+    except Exception:
+        return 0, 0
+
+
+def build_table(rows: List[Tuple[str, int]]) -> str:
+    """
+    rows: [(name, wins)]
+    """
+    prepared: List[Tuple[str, str, str]] = []
+    for i, (name, wins) in enumerate(rows, start=1):
         rank = str(i)
         nm = shorten_name(name)
-        total_s = fmt_int(total)
-        cnt_s = fmt_int(cnt)
-        prepared.append((rank, nm, total_s, cnt_s))
+        wins_s = fmt_int(wins)
+        prepared.append((rank, nm, wins_s))
 
     w_rank = max(2, max(len(r[0]) for r in prepared) if prepared else 2)
     w_name = max(4, max(len(r[1]) for r in prepared) if prepared else 4)
-    w_total = max(10, max(len(r[2]) for r in prepared) if prepared else 10)
-    w_cnt = max(6, max(len(r[3]) for r in prepared) if prepared else 6)
+    w_wins = max(4, max(len(r[2]) for r in prepared) if prepared else 4)
 
     header = (
         f"{'#':>{w_rank}}  "
         f"{'User':<{w_name}}  "
-        f"{'Claimed':>{w_total}}  "
-        f"{'Claims':>{w_cnt}}"
+        f"{'Wins':>{w_wins}}"
     )
     sep = (
         f"{'-':>{w_rank}}  "
         f"{'-' * w_name}  "
-        f"{'-' * w_total}  "
-        f"{'-' * w_cnt}"
+        f"{'-' * w_wins}"
     )
 
     lines = [header, sep]
-    for rank, nm, total_s, cnt_s in prepared:
+    for rank, nm, wins_s in prepared:
         lines.append(
-            f"{rank:>{w_rank}}  {nm:<{w_name}}  {total_s:>{w_total}}  {cnt_s:>{w_cnt}}"
+            f"{rank:>{w_rank}}  {nm:<{w_name}}  {wins_s:>{w_wins}}"
         )
 
     return "```\n" + "\n".join(lines) + "\n```"
 
 
+# ----------------------------
+# Main
+# ----------------------------
+
 def main() -> None:
     if not WEBHOOK_URL:
-        raise SystemExit("Missing DISCORD_WEBHOOK_URL_FAUCET in env.")
+        raise SystemExit("Missing DISCORD_WEBHOOK_URL_SWEEPER in env.")
     if not os.path.exists(DB_PATH):
         raise SystemExit(f"DB not found: {DB_PATH}")
 
@@ -337,20 +402,20 @@ def main() -> None:
 
     con = db()
     try:
-        top = fetch_faucet_leaderboard(con, TOP_N)
+        top = fetch_sweeper_leaderboard(con, TOP_N)
+        total_games, total_wins = fetch_sweeper_global_stats(con)
     except sqlite3.Error as e:
-        raise SystemExit(f"Faucet leaderboard DB error: {e}")
+        raise SystemExit(f"Sweeper leaderboard DB error: {e}")
     finally:
         try:
             con.close()
         except Exception:
             pass
 
-    # Resolve names (optional) and update cache
-    rows_for_table: List[Tuple[str, int, int]] = []
+    rows_for_table: List[Tuple[str, int]] = []
     cache_changed = False
 
-    for did, total, cnt in top:
+    for did, wins in top:
         key = str(did)
 
         # Prefer cached name
@@ -366,23 +431,42 @@ def main() -> None:
 
         # Fallback: mention
         if not name:
-            # Mention may display username in Discord clients; pinging controlled by allowed_mentions
             name = f"<@{key}>"
 
-        rows_for_table.append((name, total, cnt))
+        rows_for_table.append((name, wins))
 
     if cache_changed:
         save_names_cache(NAMES_CACHE_FILE, names_cache)
 
     ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
 
+    if total_games <= 0:
+        stats_text = "No Sweeper games played yet."
+    else:
+        win_rate = (total_wins / total_games) * 100.0 if total_games > 0 else 0.0
+        stats_text = (
+            f"Total games played: **{fmt_int(total_games)}**\n"
+            f"Total wins: **{fmt_int(total_wins)}**\n"
+            f"Win rate: **{win_rate:.1f}%**"
+        )
+
     if not rows_for_table:
-        msg = f"**{TITLE}**\n_No faucet claims yet._\nUpdated: {ts}"
+        msg = (
+            f"**{TITLE}**\n"
+            f"{stats_text}\n\n"
+            "_No Sweeper wins yet._\n"
+            f"Updated: {ts}"
+        )
         post_or_edit_webhook_message(WEBHOOK_URL, msg, MESSAGE_ID_FILE)
         return
 
     table = build_table(rows_for_table)
-    msg = f"**{TITLE}**\n{table}\nUpdated: {ts}"
+    msg = (
+        f"**{TITLE}**\n"
+        f"{stats_text}\n\n"
+        f"{table}\n"
+        f"Updated: {ts}"
+    )
     post_or_edit_webhook_message(WEBHOOK_URL, msg, MESSAGE_ID_FILE)
 
 

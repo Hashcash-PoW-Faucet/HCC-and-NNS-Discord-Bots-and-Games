@@ -54,6 +54,11 @@ POWER_PLANT_COST_L1 = int(os.getenv("POWER_PLANT_COST_L1", "100"))
 POWER_PLANT_COST_L2 = int(os.getenv("POWER_PLANT_COST_L2", "240"))
 POWER_PLANT_COST_L3 = int(os.getenv("POWER_PLANT_COST_L3", "360"))
 
+
+ACCELERATOR_COST_PER_HOUR =int(os.getenv("ACCELERATOR_COST_PER_HOUR", "2"))
+# How many seconds of upgrade time are shaved off per accelerator click (default: 1h)
+ACCELERATOR_STEP_SECONDS = int(os.getenv("ACCELERATOR_STEP_SECONDS", str(3600)))
+
 # Automatic pool payout: total Ħ paid out every interval (default: 60 Ħ / 4 hours)
 FACTORY_FILE = os.getenv("FACTORY_FILE", "mining_game_state.json").strip()
 if not FACTORY_FILE:
@@ -424,6 +429,86 @@ def apply_completed_upgrades(rig: dict, now_ts: int) -> bool:
     return changed
 
 
+def reduce_upgrade_timers(
+    rig: dict,
+    now_ts: int,
+    step_seconds: int,
+    include_rig: bool = True,
+    include_asics: bool = True,
+    include_gpus: bool = True,
+) -> tuple[int, int]:
+    """
+    Reduces running upgrade timers by step_seconds.
+
+    Parameters
+    ----------
+    rig : dict
+        Rig state dictionary.
+    now_ts : int
+        Current UNIX timestamp.
+    step_seconds : int
+        How many seconds to subtract from each active timer (at most).
+    include_rig : bool
+        Whether to include the rig upgrade timer.
+    include_asics : bool
+        Whether to include ASIC upgrade timers.
+    include_gpus : bool
+        Whether to include GPU upgrade timers.
+
+    Returns
+    -------
+    reduced_total : int
+        Total number of seconds shaved off across all affected timers.
+    affected_count : int
+        Number of timers that were actually reduced.
+    """
+    if not rig or not isinstance(rig, dict):
+        return 0, 0
+
+    now_ts = int(now_ts or time.time())
+    step_seconds = max(1, int(step_seconds))
+
+    reduced_total = 0
+    affected_count = 0
+
+    # Rig-Upgrade
+    if include_rig:
+        u = rig.get("upgrade_ready_time")
+        if u is not None and int(u) > now_ts:
+            remaining = int(u) - now_ts
+            reduce_by = min(step_seconds, remaining)
+            rig["upgrade_ready_time"] = now_ts + max(0, remaining - reduce_by)
+            if reduce_by > 0:
+                reduced_total += reduce_by
+                affected_count += 1
+
+    # ASIC-Upgrades
+    if include_asics:
+        for a in rig.get("asics", []) or []:
+            u = a.get("upgrade_ready_time")
+            if u is not None and int(u) > now_ts:
+                remaining = int(u) - now_ts
+                reduce_by = min(step_seconds, remaining)
+                a["upgrade_ready_time"] = now_ts + max(0, remaining - reduce_by)
+                if reduce_by > 0:
+                    reduced_total += reduce_by
+                    affected_count += 1
+
+    # GPU-Upgrades
+    if include_gpus:
+        for g in rig.get("gpus", []) or []:
+            u = g.get("upgrade_ready_time")
+            if u is not None and int(u) > now_ts:
+                remaining = int(u) - now_ts
+                reduce_by = min(step_seconds, remaining)
+                g["upgrade_ready_time"] = now_ts + max(0, remaining - reduce_by)
+                if reduce_by > 0:
+                    reduced_total += reduce_by
+                    affected_count += 1
+
+    return int(reduced_total), int(affected_count)
+
+
 class MinerView(View):
 
     class RefreshButton(discord.ui.Button):
@@ -526,7 +611,6 @@ class MinerView(View):
             rig.setdefault("gpus", []).append({"stars": 1, "upgrade_ready_time": None, "overclock_until": None})
             view.miner_bot.update_user_rig(view.user_id, rig)
             await interaction.response.send_message("🎮 GPU bought and added to your rig!", ephemeral=True)
-
 
     class BuyCpuButton(Button):
         def __init__(self, row=None):
@@ -685,6 +769,175 @@ class MinerView(View):
             dur = int(overclock_duration_seconds_for_rig(rig))
             await interaction.response.send_message(f"Select a GPU to overclock ({fmt_duration_days_only(dur)} boost):", view=oc_view, ephemeral=True)
 
+    class OverclockAllAsicsButton(Button):
+        def __init__(self, row=None):
+            disabled = (int(GAME_TREASURY_DISCORD_ID) == 0)
+            # Cost is per ASIC; total cost is calculated at click time.
+            label = f"⚡ OC all ASICs (+{OVERCLOCK_BOOST_PCT_ASIC:.0f}%, {OVERCLOCK_COST_ASIC} Ħ each)"
+            if disabled:
+                label = "⚡ OC all ASICs (treasury not set)"
+            super().__init__(
+                label=label,
+                style=discord.ButtonStyle.gray if disabled else discord.ButtonStyle.green,
+                custom_id="overclock_all_asics",
+                row=row,
+                disabled=disabled,
+            )
+
+        async def callback(self, interaction: discord.Interaction):
+            view: MinerView = self.view
+            if interaction.user.id != view.user_id:
+                await interaction.response.send_message("This is not your miner!", ephemeral=True)
+                return
+
+            rig = view.miner_bot.get_user_rig(view.user_id)
+            asics = (rig.get("asics", []) or []) if rig else []
+            if not asics:
+                await interaction.response.send_message("❌ You have no ASICs to overclock.", ephemeral=True)
+                return
+
+            if GAME_TREASURY_DISCORD_ID == 0:
+                await interaction.response.send_message("⚠️ Treasury not configured. Cannot overclock.", ephemeral=True)
+                return
+
+            now = int(time.time())
+            # Partition ASICs into active and inactive for overclock
+            active_asics = [a for a in asics if is_overclock_active(a, now)]
+            inactive_asics = [a for a in asics if not is_overclock_active(a, now)]
+
+            if not inactive_asics:
+                if active_asics:
+                    rem = max(overclock_remaining_seconds(a, now) for a in active_asics)
+                    await interaction.response.send_message(
+                        f"⚡ All ASICs are already overclocked. Remaining: {fmt_duration_hms(rem)}.",
+                        ephemeral=True,
+                    )
+                    return
+                else:
+                    await interaction.response.send_message("❌ No ASICs available to overclock.", ephemeral=True)
+                    return
+
+            total_asics = len(asics)
+            newly_overclocked = len(inactive_asics)
+            total_cost = int(newly_overclocked * OVERCLOCK_COST_ASIC)
+            bal = get_user_balance(view.user_id)
+            if bal < total_cost:
+                await interaction.response.send_message(
+                    f"❌ Not enough Ħ to overclock {newly_overclocked} ASIC(s) (cost {total_cost} Ħ).",
+                    ephemeral=True,
+                )
+                return
+
+            ok = transfer_internal(view.user_id, GAME_TREASURY_DISCORD_ID, total_cost, note="overclock all asics")
+            if not ok:
+                await interaction.response.send_message(
+                    "❌ Still processing the previous action or insufficient funds.",
+                    ephemeral=True,
+                )
+                return
+
+            dur = int(overclock_duration_seconds_for_rig(rig))
+            until_ts = now + dur
+            for a in inactive_asics:
+                if isinstance(a, dict):
+                    a["overclock_until"] = until_ts
+
+            view.miner_bot.update_user_rig(view.user_id, rig)
+
+            previously_active = len(active_asics)
+            msg = (
+                f"⚡ Overclocked {newly_overclocked} ASIC(s)! Boost +{OVERCLOCK_BOOST_PCT_ASIC:.0f}% "
+                f"for {fmt_duration_hms(dur)} (Power Plant Lvl {power_plant_level(rig)}). "
+                f"Total cost: {total_cost} Ħ."
+            )
+            if previously_active > 0:
+                msg += f" ({previously_active} ASIC(s) were already overclocked and remain boosted.)"
+            await interaction.response.send_message(msg, ephemeral=True)
+
+    class OverclockAllGpusButton(Button):
+        def __init__(self, row=None):
+            disabled = (int(GAME_TREASURY_DISCORD_ID) == 0)
+            # Cost is per GPU; total cost is calculated at click time.
+            label = f"⚡ OC all GPUs (+{OVERCLOCK_BOOST_PCT_GPU:.0f}%, {OVERCLOCK_COST_GPU} Ħ each)"
+            if disabled:
+                label = "⚡ OC all GPUs (treasury not set)"
+            super().__init__(
+                label=label,
+                style=discord.ButtonStyle.gray if disabled else discord.ButtonStyle.green,
+                custom_id="overclock_all_gpus",
+                row=row,
+                disabled=disabled,
+            )
+
+        async def callback(self, interaction: discord.Interaction):
+            view: MinerView = self.view
+            if interaction.user.id != view.user_id:
+                await interaction.response.send_message("This is not your miner!", ephemeral=True)
+                return
+
+            rig = view.miner_bot.get_user_rig(view.user_id)
+            gpus = (rig.get("gpus", []) or []) if rig else []
+            if not gpus:
+                await interaction.response.send_message("❌ You have no GPUs to overclock.", ephemeral=True)
+                return
+
+            if GAME_TREASURY_DISCORD_ID == 0:
+                await interaction.response.send_message("⚠️ Treasury not configured. Cannot overclock.", ephemeral=True)
+                return
+
+            now = int(time.time())
+            # Partition GPUs into active and inactive for overclock
+            active_gpus = [g for g in gpus if is_overclock_active(g, now)]
+            inactive_gpus = [g for g in gpus if not is_overclock_active(g, now)]
+
+            if not inactive_gpus:
+                if active_gpus:
+                    rem = max(overclock_remaining_seconds(g, now) for g in active_gpus)
+                    await interaction.response.send_message(
+                        f"⚡ All GPUs are already overclocked. Remaining: {fmt_duration_hms(rem)}.",
+                        ephemeral=True,
+                    )
+                    return
+                else:
+                    await interaction.response.send_message("❌ No GPUs available to overclock.", ephemeral=True)
+                    return
+
+            newly_overclocked = len(inactive_gpus)
+            total_cost = int(newly_overclocked * OVERCLOCK_COST_GPU)
+            bal = get_user_balance(view.user_id)
+            if bal < total_cost:
+                await interaction.response.send_message(
+                    f"❌ Not enough Ħ to overclock {newly_overclocked} GPU(s) (cost {total_cost} Ħ).",
+                    ephemeral=True,
+                )
+                return
+
+            ok = transfer_internal(view.user_id, GAME_TREASURY_DISCORD_ID, total_cost, note="overclock all gpus")
+            if not ok:
+                await interaction.response.send_message(
+                    "❌ Still processing the previous action or insufficient funds.",
+                    ephemeral=True,
+                )
+                return
+
+            dur = int(overclock_duration_seconds_for_rig(rig))
+            until_ts = now + dur
+            for g in inactive_gpus:
+                if isinstance(g, dict):
+                    g["overclock_until"] = until_ts
+
+            view.miner_bot.update_user_rig(view.user_id, rig)
+
+            previously_active = len(active_gpus)
+            msg = (
+                f"⚡ Overclocked {newly_overclocked} GPU(s)! Boost +{OVERCLOCK_BOOST_PCT_GPU:.0f}% "
+                f"for {fmt_duration_hms(dur)} (Power Plant Lvl {power_plant_level(rig)}). "
+                f"Total cost: {total_cost} Ħ."
+            )
+            if previously_active > 0:
+                msg += f" ({previously_active} GPU(s) were already overclocked and remain boosted.)"
+            await interaction.response.send_message(msg, ephemeral=True)
+
     class OverclockCpuButton(Button):
         def __init__(self, row=None):
             disabled = (int(GAME_TREASURY_DISCORD_ID) == 0)
@@ -756,6 +1009,281 @@ class MinerView(View):
                 ephemeral=True,
             )
 
+    class AcceleratorRigButton(Button):
+        def __init__(self, row=None):
+            disabled = (int(GAME_TREASURY_DISCORD_ID) == 0)
+            label = f"⏩ Speed up Rig (-1h, {ACCELERATOR_COST_PER_HOUR} Ħ)"
+            if disabled:
+                label = "⏩ Speed up Rig (treasury not set)"
+            super().__init__(
+                label=label,
+                style=discord.ButtonStyle.gray if disabled else discord.ButtonStyle.blurple,
+                custom_id="accelerate_rig",
+                row=row,
+                disabled=disabled,
+            )
+
+        async def callback(self, interaction: discord.Interaction):
+            view: MinerView = self.view
+            if interaction.user.id != view.user_id:
+                await interaction.response.send_message("This is not your miner!", ephemeral=True)
+                return
+
+            if GAME_TREASURY_DISCORD_ID == 0:
+                await interaction.response.send_message(
+                    "⚠️ Treasury not configured. Cannot accelerate rig upgrade.",
+                    ephemeral=True,
+                )
+                return
+
+            rig = view.miner_bot.get_user_rig(view.user_id)
+            if not rig or not isinstance(rig, dict):
+                await interaction.response.send_message("❌ Rig not found.", ephemeral=True)
+                return
+
+            now = int(time.time())
+            # Dry-run: check if the rig upgrade timer is active at all
+            test_rig = json.loads(json.dumps(rig))
+            reduced_test, affected_test = reduce_upgrade_timers(
+                test_rig,
+                now,
+                ACCELERATOR_STEP_SECONDS,
+                include_rig=True,
+                include_asics=False,
+                include_gpus=False,
+            )
+            if affected_test <= 0 or reduced_test <= 0:
+                await interaction.response.send_message(
+                    "⏩ No active rig upgrade to speed up right now.",
+                    ephemeral=True,
+                )
+                return
+
+            cost = int(ACCELERATOR_COST_PER_HOUR * affected_test)
+            bal = get_user_balance(view.user_id)
+            if bal < cost:
+                await interaction.response.send_message(
+                    f"❌ Not enough Ħ to accelerate the rig upgrade (need {cost} Ħ).",
+                    ephemeral=True,
+                )
+                return
+
+            ok = transfer_internal(
+                view.user_id,
+                GAME_TREASURY_DISCORD_ID,
+                cost,
+                note="accelerate rig upgrade",
+            )
+            if not ok:
+                await interaction.response.send_message(
+                    "❌ Still processing the previous action or insufficient funds.",
+                    ephemeral=True,
+                )
+                return
+
+            # Apply to real rig
+            reduced_real, _ = reduce_upgrade_timers(
+                rig,
+                now,
+                ACCELERATOR_STEP_SECONDS,
+                include_rig=True,
+                include_asics=False,
+                include_gpus=False,
+            )
+            if apply_completed_upgrades(rig, now):
+                # rig has been modified (level increased)
+                pass
+
+            view.miner_bot.update_user_rig(view.user_id, rig)
+
+            hrs = max(1, int(round(reduced_real / 3600.0)))
+            await interaction.response.send_message(
+                f"⏩ Accelerated your rig upgrade by ~{hrs}h. Cost: {cost} Ħ.",
+                ephemeral=True,
+            )
+
+    class AcceleratorAsicButton(Button):
+        def __init__(self, row=None):
+            disabled = (int(GAME_TREASURY_DISCORD_ID) == 0)
+            label = f"⏩ Speed up ASIC upgrades (-1h, {ACCELERATOR_COST_PER_HOUR} Ħ per running upgrade)"
+            if disabled:
+                label = "⏩ Speed up ASIC upgrades (treasury not set)"
+            super().__init__(
+                label=label,
+                style=discord.ButtonStyle.gray if disabled else discord.ButtonStyle.blurple,
+                custom_id="accelerate_asics",
+                row=row,
+                disabled=disabled,
+            )
+
+        async def callback(self, interaction: discord.Interaction):
+            view: MinerView = self.view
+            if interaction.user.id != view.user_id:
+                await interaction.response.send_message("This is not your miner!", ephemeral=True)
+                return
+
+            if GAME_TREASURY_DISCORD_ID == 0:
+                await interaction.response.send_message(
+                    "⚠️ Treasury not configured. Cannot accelerate ASIC upgrades.",
+                    ephemeral=True,
+                )
+                return
+
+            rig = view.miner_bot.get_user_rig(view.user_id)
+            if not rig or not isinstance(rig, dict):
+                await interaction.response.send_message("❌ Rig not found.", ephemeral=True)
+                return
+
+            now = int(time.time())
+            test_rig = json.loads(json.dumps(rig))
+            reduced_test, affected_test = reduce_upgrade_timers(
+                test_rig,
+                now,
+                ACCELERATOR_STEP_SECONDS,
+                include_rig=False,
+                include_asics=True,
+                include_gpus=False,
+            )
+            if affected_test <= 0 or reduced_test <= 0:
+                await interaction.response.send_message(
+                    "⏩ No active ASIC upgrades to speed up right now.",
+                    ephemeral=True,
+                )
+                return
+
+            cost = int(ACCELERATOR_COST_PER_HOUR * affected_test)
+            bal = get_user_balance(view.user_id)
+            if bal < cost:
+                await interaction.response.send_message(
+                    f"❌ Not enough Ħ to accelerate ASIC upgrades (need {cost} Ħ).",
+                    ephemeral=True,
+                )
+                return
+
+            ok = transfer_internal(
+                view.user_id,
+                GAME_TREASURY_DISCORD_ID,
+                cost,
+                note="accelerate asic upgrades",
+            )
+            if not ok:
+                await interaction.response.send_message(
+                    "❌ Still processing the previous action or insufficient funds.",
+                    ephemeral=True,
+                )
+                return
+
+            reduced_real, _ = reduce_upgrade_timers(
+                rig,
+                now,
+                ACCELERATOR_STEP_SECONDS,
+                include_rig=False,
+                include_asics=True,
+                include_gpus=False,
+            )
+            if apply_completed_upgrades(rig, now):
+                pass
+
+            view.miner_bot.update_user_rig(view.user_id, rig)
+
+            hrs = max(1, int(round(reduced_real / 3600.0)))
+            await interaction.response.send_message(
+                f"⏩ Accelerated your ASIC upgrades by ~{hrs}h across {affected_test} running upgrade(s). "
+                f"Cost: {cost} Ħ.",
+                ephemeral=True,
+            )
+
+    class AcceleratorGpuButton(Button):
+        def __init__(self, row=None):
+            disabled = (int(GAME_TREASURY_DISCORD_ID) == 0)
+            label = f"⏩ Speed up GPU upgrades (-1h, {ACCELERATOR_COST_PER_HOUR} Ħ per running upgrade)"
+            if disabled:
+                label = "⏩ Speed up GPU upgrades (treasury not set)"
+            super().__init__(
+                label=label,
+                style=discord.ButtonStyle.gray if disabled else discord.ButtonStyle.blurple,
+                custom_id="accelerate_gpus",
+                row=row,
+                disabled=disabled,
+            )
+
+        async def callback(self, interaction: discord.Interaction):
+            view: MinerView = self.view
+            if interaction.user.id != view.user_id:
+                await interaction.response.send_message("This is not your miner!", ephemeral=True)
+                return
+
+            if GAME_TREASURY_DISCORD_ID == 0:
+                await interaction.response.send_message(
+                    "⚠️ Treasury not configured. Cannot accelerate GPU upgrades.",
+                    ephemeral=True,
+                )
+                return
+
+            rig = view.miner_bot.get_user_rig(view.user_id)
+            if not rig or not isinstance(rig, dict):
+                await interaction.response.send_message("❌ Rig not found.", ephemeral=True)
+                return
+
+            now = int(time.time())
+            test_rig = json.loads(json.dumps(rig))
+            reduced_test, affected_test = reduce_upgrade_timers(
+                test_rig,
+                now,
+                ACCELERATOR_STEP_SECONDS,
+                include_rig=False,
+                include_asics=False,
+                include_gpus=True,
+            )
+            if affected_test <= 0 or reduced_test <= 0:
+                await interaction.response.send_message(
+                    "⏩ No active GPU upgrades to speed up right now.",
+                    ephemeral=True,
+                )
+                return
+
+            cost = int(ACCELERATOR_COST_PER_HOUR * affected_test)
+            bal = get_user_balance(view.user_id)
+            if bal < cost:
+                await interaction.response.send_message(
+                    f"❌ Not enough Ħ to accelerate GPU upgrades (need {cost} Ħ).",
+                    ephemeral=True,
+                )
+                return
+
+            ok = transfer_internal(
+                view.user_id,
+                GAME_TREASURY_DISCORD_ID,
+                cost,
+                note="accelerate gpu upgrades",
+            )
+            if not ok:
+                await interaction.response.send_message(
+                    "❌ Still processing the previous action or insufficient funds.",
+                    ephemeral=True,
+                )
+                return
+
+            reduced_real, _ = reduce_upgrade_timers(
+                rig,
+                now,
+                ACCELERATOR_STEP_SECONDS,
+                include_rig=False,
+                include_asics=False,
+                include_gpus=True,
+            )
+            if apply_completed_upgrades(rig, now):
+                pass
+
+            view.miner_bot.update_user_rig(view.user_id, rig)
+
+            hrs = max(1, int(round(reduced_real / 3600.0)))
+            await interaction.response.send_message(
+                f"⏩ Accelerated your GPU upgrades by ~{hrs}h across {affected_test} running upgrade(s). "
+                f"Cost: {cost} Ħ.",
+                ephemeral=True,
+            )
+
     def __init__(self, user_id, miner_bot, requester=None):
         super().__init__(timeout=None)
         self.user_id = int(user_id)
@@ -772,6 +1300,11 @@ class MinerView(View):
                     rig = {"rig_level": 1, "asics": [], "gpus": [], "upgrade_ready_time": None, "power_plant_level": 0}
 
                 # Core actions
+                now = int(time.time())
+                asics = rig.get("asics", []) or []
+                gpus = rig.get("gpus", []) or []
+                cpus = rig.get("cpus", []) or []
+
                 self.add_item(self.RefreshButton(self.user_id, self.miner_bot, row=0))
                 self.add_item(self.BuyAsicButton(row=1))
                 self.add_item(self.BuyGpuButton(row=2))
@@ -779,8 +1312,31 @@ class MinerView(View):
                 self.add_item(self.UpgradeAsicButton(row=1))
                 self.add_item(self.UpgradeGpuButton(row=2))
                 self.add_item(self.OverclockAsicButton(row=1))
+
+                # Accelerators: separate buttons for Rig, ASIC and GPU upgrades.
+                self.add_item(self.AcceleratorRigButton(row=4))
+                self.add_item(self.AcceleratorAsicButton(row=4))
+                self.add_item(self.AcceleratorGpuButton(row=4))
+
+                # Overclock all ASICs button: disable if all ASICs already have active OC
+                oc_all_asics_btn = self.OverclockAllAsicsButton(row=1)
+                if asics and all(is_overclock_active(a, now) for a in asics):
+                    oc_all_asics_btn.disabled = True
+                self.add_item(oc_all_asics_btn)
+
                 self.add_item(self.OverclockGpuButton(row=2))
-                self.add_item(self.OverclockCpuButton(row=3))
+
+                # Overclock all GPUs button: disable if all GPUs already have active OC
+                oc_all_gpus_btn = self.OverclockAllGpusButton(row=2)
+                if gpus and all(is_overclock_active(g, now) for g in gpus):
+                    oc_all_gpus_btn.disabled = True
+                self.add_item(oc_all_gpus_btn)
+
+                # CPU overclock button: disable if any CPU already has active OC
+                oc_cpu_btn = self.OverclockCpuButton(row=3)
+                if cpus and any(is_overclock_active(c, now) for c in cpus):
+                    oc_cpu_btn.disabled = True
+                self.add_item(oc_cpu_btn)
 
                 # Rig upgrade button
                 current_level = int(rig.get("rig_level", 1) or 1)
