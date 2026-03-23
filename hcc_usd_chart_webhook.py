@@ -5,12 +5,13 @@ hcc_usd_chart_webhook.py
 Displays the HCC/USD price for the last 24 hours as a time series.
 
 Price calculation:
-  spot = (veco_reserve_sat / 1e8) / hcc_reserve   # VECO per HCC
+  spot_veco = (veco_reserve_sat / 1e8) / hcc_reserve_veco   # VECO per HCC
+  spot_nns  = (nns_reserve_sat  / 1e8) / hcc_reserve_nns    # NNS per HCC
   veco_usd = VECO price from CoinPaprika (veco-veco)
-  hcc_usd = spot * veco_usd
+  hcc_usd = spot_veco * veco_usd
 
 This script:
-  - reads amm_pool.id=1 (current pool state),
+  - reads amm_pool.id=1 (current pool state for HCC/VECO and HCC/NNS),
   - fetches the VECO price from CoinPaprika,
   - stores each sample in a JSON state file,
   - drops all samples older than WINDOW_SECONDS (default 24h),
@@ -46,7 +47,7 @@ import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Any
 from urllib.parse import urlparse, parse_qsl, urlencode
 
 import requests
@@ -83,19 +84,31 @@ def db_connect(path: str) -> sqlite3.Connection:
     return con
 
 
-def get_current_pool(con: sqlite3.Connection) -> Tuple[int, int]:
+def get_current_pool(con: sqlite3.Connection) -> Dict[str, int]:
     row = con.execute(
-        "SELECT hcc_reserve, veco_reserve_sat FROM amm_pool WHERE id=1"
+        "SELECT hcc_reserve_veco, veco_reserve_sat, hcc_reserve_nns, nns_reserve_sat FROM amm_pool WHERE id=1"
     ).fetchone()
     if not row:
         raise RuntimeError("AMM pool not initialized (amm_pool.id=1 missing)")
-    return int(row[0]), int(row[1])
+    return {
+        "hcc_reserve_veco": int(row[0]),
+        "veco_reserve_sat": int(row[1]),
+        "hcc_reserve_nns": int(row[2]),
+        "nns_reserve_sat": int(row[3]),
+    }
 
 
-def spot_from_reserves(hcc_reserve: int, veco_reserve_sat: int) -> Optional[float]:
-    if hcc_reserve <= 0 or veco_reserve_sat <= 0:
+
+def spot_from_veco_reserves(hcc_reserve_veco: int, veco_reserve_sat: int) -> Optional[float]:
+    if hcc_reserve_veco <= 0 or veco_reserve_sat <= 0:
         return None
-    return (veco_reserve_sat / VECO_SATS) / float(hcc_reserve)
+    return (veco_reserve_sat / VECO_SATS) / float(hcc_reserve_veco)
+
+
+def spot_from_nns_reserves(hcc_reserve_nns: int, nns_reserve_sat: int) -> Optional[float]:
+    if hcc_reserve_nns <= 0 or nns_reserve_sat <= 0:
+        return None
+    return (nns_reserve_sat / VECO_SATS) / float(hcc_reserve_nns)
 
 
 def fetch_veco_usd(url: str, timeout: int = 10) -> float:
@@ -109,12 +122,14 @@ def fetch_veco_usd(url: str, timeout: int = 10) -> float:
         raise RuntimeError("Unexpected CoinPaprika JSON format")
 
 
+
 @dataclass
 class Sample:
     ts: int               # Unix timestamp
-    spot: float           # VECO/HCC
+    spot_veco: float      # VECO/HCC
+    spot_nns: float       # NNS/HCC
     veco_usd: float       # USD per VECO
-    hcc_usd: float        # USD per HCC
+    hcc_usd: float        # USD per HCC (derived from VECO pool)
 
 
 def load_samples(path: Path) -> List[Sample]:
@@ -132,7 +147,8 @@ def load_samples(path: Path) -> List[Sample]:
                 samples.append(
                     Sample(
                         ts=int(item["ts"]),
-                        spot=float(item["spot"]),
+                        spot_veco=float(item.get("spot_veco", item.get("spot", 0.0))),
+                        spot_nns=float(item.get("spot_nns", 0.0)),
                         veco_usd=float(item["veco_usd"]),
                         hcc_usd=float(item["hcc_usd"]),
                     )
@@ -168,7 +184,8 @@ def save_samples(path: Path, samples: List[Sample]) -> None:
         pass
 
 
-def render_chart(samples: List[Sample]) -> bytes:
+
+def render_hcc_usd_chart(samples: List[Sample]) -> bytes:
     # sort by time
     samples = sorted(samples, key=lambda s: s.ts)
     xs = [datetime.fromtimestamp(s.ts, tz=timezone.utc) for s in samples]
@@ -221,6 +238,59 @@ def render_chart(samples: List[Sample]) -> bytes:
         bbox=dict(boxstyle="round,pad=0.3", fc="#4aa3ff", ec="none", alpha=0.96),
         zorder=10,
     )
+
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def render_hcc_pair_chart(samples: List[Sample]) -> bytes:
+    samples = sorted(samples, key=lambda s: s.ts)
+    xs = [datetime.fromtimestamp(s.ts, tz=timezone.utc) for s in samples]
+    ys_veco = [s.spot_veco for s in samples]
+    ys_nns = [s.spot_nns for s in samples]
+
+    fig = plt.figure(figsize=(7.6, 4.8), dpi=170, facecolor="#0f1117")
+    ax = fig.add_subplot(111, facecolor="#0f1117")
+
+    ax.plot(xs, ys_veco, "-", linewidth=2.2, color="#4aa3ff", alpha=0.95, label="HCC/VECO pool")
+    ax.plot(xs, ys_nns, "-", linewidth=2.2, color="#ffb347", alpha=0.95, label="HCC/NNS pool")
+
+    if ys_veco:
+        ax.scatter([xs[-1]], [ys_veco[-1]], s=60, color="#4aa3ff", zorder=6)
+    if ys_nns:
+        ax.scatter([xs[-1]], [ys_nns[-1]], s=60, color="#ffb347", zorder=6)
+
+    ax.set_title("HCC Pair Price", color="#eaeaea", fontsize=15, fontweight="bold", pad=10)
+    ax.set_ylabel("Quote asset per HCC", color="#d6d6d6", fontsize=12)
+    ax.set_xlabel("Time (UTC)", color="#d6d6d6", fontsize=12)
+
+    locator = mdates.AutoDateLocator(minticks=4, maxticks=8)
+    formatter = mdates.DateFormatter("%H:%M")
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(formatter)
+    fig.autofmt_xdate(rotation=30, ha="right")
+
+    ax.tick_params(axis="x", colors="#cfcfcf", labelsize=10)
+    ax.tick_params(axis="y", colors="#cfcfcf", labelsize=10)
+
+    ax.grid(True, axis="y", linestyle="-", linewidth=1.0, alpha=0.18)
+    ax.grid(True, axis="x", linestyle=":", linewidth=0.8, alpha=0.10)
+
+    all_ys = [y for y in (ys_veco + ys_nns) if y is not None]
+    if all_ys:
+        y_min, y_max = min(all_ys), max(all_ys)
+        span = y_max - y_min
+        pad = span * 0.25 if span > 0 else max(1e-6, y_max * 0.10 if y_max > 0 else 1e-6)
+        ax.set_ylim(y_min - pad, y_max + pad)
+
+    leg = ax.legend(loc="best", frameon=True)
+    leg.get_frame().set_facecolor("#0f1117")
+    leg.get_frame().set_alpha(0.65)
+    for text in leg.get_texts():
+        text.set_color("#eaeaea")
 
     fig.tight_layout()
     buf = io.BytesIO()
@@ -333,7 +403,7 @@ def request_with_rate_limit_retry(
 def discord_webhook_post_or_patch(
     webhook_url: str,
     message_id: Optional[str],
-    png_bytes: bytes,
+    files_payload: List[Tuple[str, bytes, str]],
     content: str,
     username: Optional[str] = None,
     avatar_url: Optional[str] = None,
@@ -354,10 +424,14 @@ def discord_webhook_post_or_patch(
             payload["avatar_url"] = avatar_url
 
     files = None
-    if png_bytes:
-        payload["attachments"] = [{"id": 0, "filename": "hcc_usd_chart.png"}]
+    if files_payload:
+        payload["attachments"] = [
+            {"id": idx, "filename": filename}
+            for idx, (filename, _blob, _mime) in enumerate(files_payload)
+        ]
         files = {
-            "files[0]": ("hcc_usd_chart.png", png_bytes, "image/png"),
+            f"files[{idx}]": (filename, blob, mime)
+            for idx, (filename, blob, mime) in enumerate(files_payload)
         }
 
     data = {"payload_json": json.dumps(payload)}
@@ -425,7 +499,7 @@ def main() -> int:
         return 2
 
     try:
-        hcc_res, veco_res_sat = get_current_pool(con)
+        pool = get_current_pool(con)
     except Exception as e:
         con.close()
         print(f"ERROR: {e}")
@@ -436,9 +510,13 @@ def main() -> int:
         except Exception:
             pass
 
-    spot = spot_from_reserves(hcc_res, veco_res_sat)
-    if spot is None:
-        print("ERROR: invalid pool reserves for spot computation.")
+    spot_veco = spot_from_veco_reserves(pool["hcc_reserve_veco"], pool["veco_reserve_sat"])
+    spot_nns = spot_from_nns_reserves(pool["hcc_reserve_nns"], pool["nns_reserve_sat"])
+    if spot_veco is None:
+        print("ERROR: invalid HCC/VECO pool reserves for spot computation.")
+        return 4
+    if spot_nns is None:
+        print("ERROR: invalid HCC/NNS pool reserves for spot computation.")
         return 4
 
     # --- fetch VECO price ---
@@ -448,14 +526,26 @@ def main() -> int:
         print(f"ERROR: could not fetch VECO price: {e}")
         return 5
 
-    hcc_usd = spot * veco_usd
+    hcc_usd = spot_veco * veco_usd
     now_ts = int(time.time())
 
-    print(f"Spot: {spot:.8f} VECO/HCC | VECO: {veco_usd:.8f} USD | HCC: {hcc_usd:.10f} USD")
+    print(
+        f"Spot VECO: {spot_veco:.8f} VECO/HCC | "
+        f"Spot NNS: {spot_nns:.8f} NNS/HCC | "
+        f"VECO: {veco_usd:.8f} USD | HCC: {hcc_usd:.10f} USD"
+    )
 
     # --- load samples, append new one, prune old ones ---
     samples = load_samples(state_path)
-    samples.append(Sample(ts=now_ts, spot=spot, veco_usd=veco_usd, hcc_usd=hcc_usd))
+    samples.append(
+        Sample(
+            ts=now_ts,
+            spot_veco=spot_veco,
+            spot_nns=spot_nns,
+            veco_usd=veco_usd,
+            hcc_usd=hcc_usd,
+        )
+    )
 
     cutoff = now_ts - window_seconds
     samples = [s for s in samples if s.ts >= cutoff]
@@ -467,22 +557,24 @@ def main() -> int:
         print(msg)
         if webhook_url:
             ok, info = discord_webhook_post_or_patch(
-                webhook_url, message_id, b"", msg, username=username, avatar_url=avatar_url
+                webhook_url, message_id, [], msg, username=username, avatar_url=avatar_url
             )
             print(("OK: " if ok else "ERROR: ") + info)
         return 0
 
-    # --- render chart ---
-    png = render_chart(samples)
+    # --- render charts ---
+    png_usd = render_hcc_usd_chart(samples)
+    png_pairs = render_hcc_pair_chart(samples)
 
     # Discord text
     last = max(samples, key=lambda s: s.ts)
     window_hours = window_seconds / 3600.0
     content = (
-        f"**HCC/USD price** (via pool spot × VECO/USDT from CoinPaprika)\n"
+        f"**HCC price charts**\n"
         f"Window: last **{window_hours:.1f} h** • Samples: **{len(samples)}**\n"
-        f"Spot: **{last.spot:.6f} VECO/HCC**\n"
-        f"VECO: **{last.veco_usd:.6f} USD** • HCC: **{last.hcc_usd:.8f} USD**\n"
+        f"HCC/VECO: **{last.spot_veco:.6f} VECO per HCC**\n"
+        f"HCC/NNS: **{last.spot_nns:.6f} NNS per HCC**\n"
+        f"VECO: **{last.veco_usd:.6f} USD** • HCC/USD: **{last.hcc_usd:.8f} USD**\n"
         f"Last update: {fmt_utc(last.ts)}"
     )
 
@@ -490,7 +582,10 @@ def main() -> int:
         ok, info = discord_webhook_post_or_patch(
             webhook_url,
             message_id,
-            png,
+            [
+                ("hcc_usd_chart.png", png_usd, "image/png"),
+                ("hcc_pair_chart.png", png_pairs, "image/png"),
+            ],
             content,
             username=username,
             avatar_url=avatar_url,
@@ -505,7 +600,10 @@ def main() -> int:
                 ok, info = discord_webhook_post_or_patch(
                     webhook_url,
                     None,
-                    png,
+                    [
+                        ("hcc_usd_chart.png", png_usd, "image/png"),
+                        ("hcc_pair_chart.png", png_pairs, "image/png"),
+                    ],
                     content,
                     username=username,
                     avatar_url=avatar_url,
