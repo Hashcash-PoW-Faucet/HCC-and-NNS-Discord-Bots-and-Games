@@ -3,7 +3,7 @@ import os
 import json
 import time
 import asyncio
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 import aiohttp
 import discord
@@ -23,7 +23,38 @@ AIRDROP_DURATION_SECONDS = int(os.environ.get("AIRDROP_DURATION_SECONDS", "12960
 
 # Optional: fixed start timestamp.
 # If empty, the bot creates the window on first start.
+
 AIRDROP_START_TS = os.environ.get("AIRDROP_START_TS", "").strip()
+AIRDROP_RESET_KEEP_HISTORY = os.environ.get("AIRDROP_RESET_KEEP_HISTORY", "1").strip() == "1"
+def make_fresh_state(start_ts: Optional[int] = None, duration_seconds: Optional[int] = None) -> Dict[str, Any]:
+    if start_ts is None:
+        start_ts = int(AIRDROP_START_TS) if AIRDROP_START_TS else now_ts()
+    if duration_seconds is None:
+        duration_seconds = AIRDROP_DURATION_SECONDS
+    end_ts = int(start_ts) + int(duration_seconds)
+    return {
+        "airdrop_start_ts": int(start_ts),
+        "airdrop_end_ts": int(end_ts),
+        "registrations": {}
+    }
+
+
+def archive_airdrop_json() -> Optional[str]:
+    if not os.path.exists(AIRDROP_JSON):
+        return None
+    ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(now_ts()))
+    archived = f"{AIRDROP_JSON}.archive_{ts}"
+    os.replace(AIRDROP_JSON, archived)
+    return archived
+
+
+def reset_airdrop_state(start_ts: Optional[int] = None, duration_seconds: Optional[int] = None, keep_history: bool = True) -> Tuple[Dict[str, Any], Optional[str]]:
+    archived = None
+    if keep_history and os.path.exists(AIRDROP_JSON):
+        archived = archive_airdrop_json()
+    state = make_fresh_state(start_ts=start_ts, duration_seconds=duration_seconds)
+    save_state(state)
+    return state, archived
 
 
 GUILD_ID = os.environ.get("GUILD_ID", "").strip()
@@ -37,13 +68,7 @@ def now_ts() -> int:
 
 def load_state() -> Dict[str, Any]:
     if not os.path.exists(AIRDROP_JSON):
-        start_ts = int(AIRDROP_START_TS) if AIRDROP_START_TS else now_ts()
-        end_ts = start_ts + AIRDROP_DURATION_SECONDS
-        state = {
-            "airdrop_start_ts": start_ts,
-            "airdrop_end_ts": end_ts,
-            "registrations": {}
-        }
+        state = make_fresh_state()
         save_state(state)
         return state
 
@@ -52,20 +77,17 @@ def load_state() -> Dict[str, Any]:
             data = json.load(f)
         if "registrations" not in data or not isinstance(data["registrations"], dict):
             data["registrations"] = {}
-        if "airdrop_end_ts" not in data:
-            start_ts = int(AIRDROP_START_TS) if AIRDROP_START_TS else now_ts()
-            data["airdrop_start_ts"] = start_ts
-            data["airdrop_end_ts"] = start_ts + AIRDROP_DURATION_SECONDS
+        if "airdrop_start_ts" not in data or "airdrop_end_ts" not in data:
+            fresh = make_fresh_state()
+            data["airdrop_start_ts"] = int(fresh["airdrop_start_ts"])
+            data["airdrop_end_ts"] = int(fresh["airdrop_end_ts"])
         return data
     except Exception:
-        start_ts = int(AIRDROP_START_TS) if AIRDROP_START_TS else now_ts()
-        state = {
-            "airdrop_start_ts": start_ts,
-            "airdrop_end_ts": start_ts + AIRDROP_DURATION_SECONDS,
-            "registrations": {}
-        }
+        state = make_fresh_state()
         save_state(state)
         return state
+
+# ---- New airdrop finalization helpers and command ----
 
 
 def save_state(state: Dict[str, Any]) -> None:
@@ -263,6 +285,63 @@ async def airdrop_status(interaction: discord.Interaction):
         )
 
     await interaction.response.send_message(msg, ephemeral=True)
+
+
+# ---- Admin: reset airdrop state ----
+
+@bot.tree.command(name="reset_airdrop", description="(Admin) Start a fresh airdrop window and clear old registrations.")
+@app_commands.describe(
+    duration_hours="Optional new registration duration in hours (default: current env setting)",
+    start_now="If true, start now; otherwise AIRDROP_START_TS is used if configured",
+    keep_history="If true, archive the old JSON before resetting"
+)
+async def reset_airdrop(
+    interaction: discord.Interaction,
+    duration_hours: Optional[int] = None,
+    start_now: bool = True,
+    keep_history: bool = AIRDROP_RESET_KEEP_HISTORY,
+):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    if not is_admin(interaction):
+        await interaction.followup.send("Admin only.", ephemeral=True)
+        return
+
+    if duration_hours is not None and int(duration_hours) <= 0:
+        await interaction.followup.send("duration_hours must be > 0", ephemeral=True)
+        return
+
+    duration_seconds = AIRDROP_DURATION_SECONDS
+    if duration_hours is not None:
+        duration_seconds = int(duration_hours) * 3600
+
+    start_ts = None
+    if start_now:
+        start_ts = now_ts()
+
+    async with bot.file_lock:
+        state, archived = reset_airdrop_state(
+            start_ts=start_ts,
+            duration_seconds=duration_seconds,
+            keep_history=bool(keep_history),
+        )
+
+    start_ts_out = int(state["airdrop_start_ts"])
+    end_ts_out = int(state["airdrop_end_ts"])
+
+    msg = (
+        "Airdrop reset successful ✅\n"
+        f"Start: <t:{start_ts_out}:F>\n"
+        f"End: <t:{end_ts_out}:F>\n"
+        f"Duration: **{int(duration_seconds) // 3600}h**\n"
+        "Registrations cleared: **yes**"
+    )
+    if archived:
+        msg += f"\nArchived old file: `{archived}`"
+    else:
+        msg += "\nArchived old file: `(none)`"
+
+    await interaction.followup.send(msg, ephemeral=True)
 
 
 # ---- New airdrop finalization helpers and command ----

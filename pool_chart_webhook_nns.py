@@ -2,7 +2,7 @@
 """
 pool_chart_webhook.py
 
-Shows N recent spot price changes of the AMM pool (VECO/HCC).
+Shows N recent spot price changes of the AMM pool (NNS/HCC).
 The points are based ONLY on the pool spot price after each successful swap.
 All last N successful swaps are shown, even if consecutive spot prices are identical.
 
@@ -10,11 +10,11 @@ Env:
   TIPBOT_DB=/path/to/tipbot.db
   SPOT_CHART_LAST_N_SWAPS=40       # how many last successful swaps to display
 
-  DISCORD_WEBHOOK_URL_CHART=...
-  DISCORD_WEBHOOK_MESSAGE_ID=...   (optional)
-  DISCORD_WEBHOOK_STATE_FILE=/path/.spot_chart_state.json (optional)
-  DISCORD_WEBHOOK_USERNAME=...     (optional, nur bei POST)
-  DISCORD_WEBHOOK_AVATAR_URL=...   (optional, nur bei POST)
+  DISCORD_WEBHOOK_URL_CHART_NNS=...
+  DISCORD_WEBHOOK_MESSAGE_ID_NNS=...   (optional)
+  DISCORD_WEBHOOK_STATE_FILE_NNS=/path/.spot_chart_state_nns.json (optional)
+  DISCORD_WEBHOOK_USERNAME_NNS=...     (optional, only with POST)
+  DISCORD_WEBHOOK_AVATAR_URL_NNS=...   (optional, only with POST)
 """
 
 import os
@@ -34,7 +34,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa
 
-VECO_SATS = 100_000_000
+NNS_SATS = 100_000_000
 
 
 # ------- helpers -------
@@ -58,7 +58,7 @@ def clamp_int(v: int, lo: int, hi: int) -> int:
 class SpotPoint:
     swap_id: int
     ts: int
-    price_veco_per_hcc: float
+    price_hcc_per_nns: float
 
 
 def db_connect(path: str) -> sqlite3.Connection:
@@ -69,7 +69,7 @@ def db_connect(path: str) -> sqlite3.Connection:
 
 def get_current_pool(con: sqlite3.Connection) -> Tuple[int, int]:
     row = con.execute(
-        "SELECT hcc_reserve, veco_reserve_sat FROM amm_pool WHERE id=1"
+        "SELECT hcc_reserve, nns_reserve_sat FROM amm_pool WHERE id=1"
     ).fetchone()
     if not row:
         raise RuntimeError("AMM pool not initialized (amm_pool.id=1 missing)")
@@ -83,9 +83,9 @@ def fetch_last_swaps(con: sqlite3.Connection, limit: int) -> List[sqlite3.Row]:
         FROM swap_log
         WHERE status='ok'
           AND (
-            (from_asset='HCC' AND to_asset='VECO')
+            (from_asset='HCC' AND to_asset='NNS')
             OR
-            (from_asset='VECO' AND to_asset='HCC')
+            (from_asset='NNS' AND to_asset='HCC')
           )
         ORDER BY id DESC
         LIMIT ?
@@ -95,27 +95,30 @@ def fetch_last_swaps(con: sqlite3.Connection, limit: int) -> List[sqlite3.Row]:
     return list(rows)
 
 
-def spot_from_reserves(hcc_reserve: int, veco_reserve_sat: int) -> Optional[float]:
-    if hcc_reserve <= 0 or veco_reserve_sat <= 0:
+def spot_hcc_per_nns_from_reserves(hcc_reserve: int, nns_reserve_sat: int) -> Optional[float]:
+    if hcc_reserve <= 0 or nns_reserve_sat <= 0:
         return None
-    return (veco_reserve_sat / VECO_SATS) / float(hcc_reserve)
+    nns_units = nns_reserve_sat / NNS_SATS
+    if nns_units <= 0:
+        return None
+    return float(hcc_reserve) / nns_units
 
 
 def invert_swap(
     hcc_reserve_after: int,
-    veco_reserve_after: int,
+    nns_reserve_after: int,
     row: sqlite3.Row,
 ) -> Tuple[int, int]:
     """
     Reconstructs the pool reserves BEFORE this swap from the state AFTER the swap.
     Uses the same formulas as the bot:
 
-    HCC -> VECO:
+    HCC -> NNS:
       new_hcc = old_hcc + (amount_in - fee_amount)
-      new_veco = old_veco - amount_out
+      new_nns = old_nns - amount_out
 
-    VECO -> HCC:
-      new_veco = old_veco + (amount_in - fee_amount)
+    NNS -> HCC:
+      new_nns = old_nns + (amount_in - fee_amount)
       new_hcc = old_hcc - amount_out
     """
     fa = str(row["from_asset"] or "").upper()
@@ -125,19 +128,19 @@ def invert_swap(
     fee = int(row["fee_amount"] or 0)
 
     h_after = int(hcc_reserve_after)
-    v_after = int(veco_reserve_after)
+    v_after = int(nns_reserve_after)
 
     if ain <= 0 or aout <= 0:
         return h_after, v_after
 
-    if fa == "HCC" and ta == "VECO":
+    if fa == "HCC" and ta == "NNS":
         # new_h = old_h + (ain - fee)  => old_h = new_h - (ain - fee)
         # new_v = old_v - aout         => old_v = new_v + aout
         old_h = h_after - (ain - fee)
         old_v = v_after + aout
         return old_h, old_v
 
-    if fa == "VECO" and ta == "HCC":
+    if fa == "NNS" and ta == "HCC":
         # new_v = old_v + (ain - fee)  => old_v = new_v - (ain - fee)
         # new_h = old_h - aout         => old_h = new_h + aout
         old_v = v_after - (ain - fee)
@@ -253,13 +256,13 @@ def build_spot_series(
 
     for r in rows_desc:
         # Spot after this swap (current state h_after, v_after)
-        spot = spot_from_reserves(h_after, v_after)
+        spot = spot_hcc_per_nns_from_reserves(h_after, v_after)
         if spot is not None:
             spots_desc.append(
                 SpotPoint(
                     swap_id=int(r["id"]),
                     ts=int(r["ts"] or 0),
-                    price_veco_per_hcc=float(spot),
+                    price_hcc_per_nns=float(spot),
                 )
             )
 
@@ -274,7 +277,7 @@ def build_spot_series(
 
 
 def render_chart(points: List[SpotPoint], title: str) -> bytes:
-    ys = [p.price_veco_per_hcc for p in points]
+    ys = [p.price_hcc_per_nns for p in points]
     xs = list(range(1, len(ys) + 1))
 
     fig = plt.figure(figsize=(7.2, 5.2), dpi=170, facecolor="#0f1117")
@@ -287,7 +290,7 @@ def render_chart(points: List[SpotPoint], title: str) -> bytes:
     ax.fill_between(xs, ys, baseline, step="post", color="#4aa3ff", alpha=0.10)
 
     ax.set_title(title, color="#eaeaea", pad=12, fontsize=16, fontweight="bold")
-    ax.set_ylabel("VECO per HCC (pool spot)", color="#d6d6d6", fontsize=13)
+    ax.set_ylabel("HCC per NNS (pool spot)", color="#d6d6d6", fontsize=13)
     ax.set_xlabel("Spot change index", color="#d6d6d6", fontsize=13)
 
     ax.tick_params(axis="x", colors="#cfcfcf", labelsize=12)
@@ -335,7 +338,7 @@ def discord_webhook_post_or_patch(
     avatar_url: Optional[str] = None,
 ) -> Tuple[bool, str]:
     if not webhook_url:
-        return False, "DISCORD_WEBHOOK_URL_CHART is empty"
+        return False, "DISCORD_WEBHOOK_URL_CHART_NNS is empty"
 
     base_url, query = build_webhook_base_and_query(webhook_url)
     params = dict(query)
@@ -392,20 +395,20 @@ def main() -> int:
         int(os.environ.get("SPOT_CHART_LAST_N_SWAPS", "40")), 2, 500
     )
 
-    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL_CHART", "").strip()
-    message_id = os.environ.get("DISCORD_WEBHOOK_MESSAGE_ID", "").strip() or None
+    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL_CHART_NNS", "").strip()
+    message_id = os.environ.get("DISCORD_WEBHOOK_MESSAGE_ID_NNS", "").strip() or None
 
     state_file = os.environ.get(
-        "DISCORD_WEBHOOK_STATE_FILE",
-        str(Path(__file__).resolve().parent / ".spot_chart_state.json"),
+        "DISCORD_WEBHOOK_STATE_FILE_NNS",
+        str(Path(__file__).resolve().parent / ".spot_chart_state_nns.json"),
     ).strip()
     state_path = Path(state_file)
 
     if not message_id:
         message_id = load_message_id_from_state(state_path)
 
-    username = os.environ.get("DISCORD_WEBHOOK_USERNAME", "").strip() or None
-    avatar_url = os.environ.get("DISCORD_WEBHOOK_AVATAR_URL", "").strip() or None
+    username = os.environ.get("DISCORD_WEBHOOK_USERNAME_NNS", "").strip() or None
+    avatar_url = os.environ.get("DISCORD_WEBHOOK_AVATAR_URL_NNS", "").strip() or None
 
     try:
         con = db_connect(db_path)
@@ -441,11 +444,11 @@ def main() -> int:
         return 0
 
     last = points[-1]
-    title = f"VECO/HCC pool spot (last {len(points)} swaps)"
+    title = f"HCC/NNS pool spot (last {len(points)} swaps)"
     content = (
-        f"**Pool spot price** (VECO/HCC)\n"
+        f"**Pool spot price** (HCC/NNS)\n"
         f"Points: **{len(points)}** (last successful swaps)\n"
-        f"Last: **{last.price_veco_per_hcc:.4f} VECO/HCC** • {fmt_utc(last.ts)}"
+        f"Last: **{last.price_hcc_per_nns:.6f} HCC/NNS** • {fmt_utc(last.ts)}"
     )
 
     png = render_chart(points, title=title)
@@ -482,7 +485,7 @@ def main() -> int:
                 save_message_id_to_state(state_path, new_mid)
                 print(f"Saved webhook message id to state: {state_path}")
     else:
-        print("DISCORD_WEBHOOK_URL_CHART not set; generated chart only (no post).")
+        print("DISCORD_WEBHOOK_URL_CHART_NNS not set; generated chart only (no post).")
 
     return 0
 
