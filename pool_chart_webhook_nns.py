@@ -69,7 +69,7 @@ def db_connect(path: str) -> sqlite3.Connection:
 
 def get_current_pool(con: sqlite3.Connection) -> Tuple[int, int]:
     row = con.execute(
-        "SELECT hcc_reserve, nns_reserve_sat FROM amm_pool WHERE id=1"
+        "SELECT hcc_reserve_nns, nns_reserve_sat FROM amm_pool WHERE id=1"
     ).fetchone()
     if not row:
         raise RuntimeError("AMM pool not initialized (amm_pool.id=1 missing)")
