@@ -4,6 +4,8 @@ import sqlite3
 import time
 from typing import Any, Iterable, List, Tuple, Optional
 
+from decimal import Decimal
+
 
 def fmt_ts(ts: Any) -> str:
     try:
@@ -19,6 +21,26 @@ def shorten(s: Any, n: int = 80) -> str:
     s = "" if s is None else str(s)
     s = s.replace("\n", "\\n")
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+SATS = 100_000_000
+
+
+
+def fmt_coin_sat(v: Any) -> str:
+    try:
+        n = int(v or 0)
+        return f"{(Decimal(n) / Decimal(SATS)):.8f}"
+    except Exception:
+        return str(v)
+
+
+def fmt_coin_sat_decimal(v: Any) -> str:
+    try:
+        d = Decimal(str(v or "0"))
+        return f"{(d / Decimal(SATS)):.8f}"
+    except Exception:
+        return str(v)
 
 
 def print_table(title: str, headers: List[str], rows: List[Tuple[Any, ...]]) -> None:
@@ -72,17 +94,48 @@ def table_columns(con: sqlite3.Connection, name: str) -> List[str]:
     # PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
     return [r[1] for r in rows]
 
+def first_existing(cols: List[str], candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in cols:
+            return c
+    return None
+
+
 
 def dump_users(con: sqlite3.Connection, limit: Optional[int]) -> None:
     if not table_exists(con, "users"):
         print("Table 'users' not found.")
         return
 
-    q = """
-    SELECT discord_id, address, balance, created_at, updated_at, last_withdraw_at
-    FROM users
-    ORDER BY balance DESC, updated_at DESC
-    """
+    cols = table_columns(con, "users")
+    has_veco_internal = "veco_internal_sat" in cols
+    has_veco_deposit = "veco_deposit_address" in cols
+    has_nns_internal = "nns_internal_sat" in cols
+    has_nns_deposit = "nns_deposit_address" in cols
+
+    select_cols = [
+        "discord_id",
+        "address",
+        "balance",
+    ]
+    if has_veco_internal:
+        select_cols.append("veco_internal_sat")
+    if has_veco_deposit:
+        select_cols.append("veco_deposit_address")
+    if has_nns_internal:
+        select_cols.append("nns_internal_sat")
+    if has_nns_deposit:
+        select_cols.append("nns_deposit_address")
+    select_cols.extend(["created_at", "updated_at", "last_withdraw_at"])
+
+    order_parts = ["balance DESC"]
+    if has_veco_internal:
+        order_parts.append("veco_internal_sat DESC")
+    if has_nns_internal:
+        order_parts.append("nns_internal_sat DESC")
+    order_parts.append("updated_at DESC")
+
+    q = f"SELECT {', '.join(select_cols)} FROM users ORDER BY {', '.join(order_parts)}"
     if limit:
         q += " LIMIT ?"
         rows = fetch_all(con, q, (limit,))
@@ -90,19 +143,65 @@ def dump_users(con: sqlite3.Connection, limit: Optional[int]) -> None:
         rows = fetch_all(con, q)
 
     pretty = []
-    for discord_id, address, balance, created_at, updated_at, last_w in rows:
-        pretty.append((
+    for r in rows:
+        idx = 0
+        discord_id = r[idx]; idx += 1
+        address = r[idx]; idx += 1
+        balance = r[idx]; idx += 1
+        veco_internal_sat = None
+        if has_veco_internal:
+            veco_internal_sat = r[idx]
+            idx += 1
+        veco_deposit_address = None
+        if has_veco_deposit:
+            veco_deposit_address = r[idx]
+            idx += 1
+        nns_internal_sat = None
+        if has_nns_internal:
+            nns_internal_sat = r[idx]
+            idx += 1
+        nns_deposit_address = None
+        if has_nns_deposit:
+            nns_deposit_address = r[idx]
+            idx += 1
+        created_at = r[idx]; idx += 1
+        updated_at = r[idx]; idx += 1
+        last_w = r[idx]; idx += 1
+
+        row_out: List[Any] = [
             discord_id,
             address or "",
             balance,
+        ]
+        if has_veco_internal:
+            row_out.append(fmt_coin_sat(veco_internal_sat if veco_internal_sat is not None else 0))
+        if has_veco_deposit:
+            row_out.append(veco_deposit_address or "")
+        if has_nns_internal:
+            row_out.append(fmt_coin_sat(nns_internal_sat if nns_internal_sat is not None else 0))
+        if has_nns_deposit:
+            row_out.append(nns_deposit_address or "")
+        row_out.extend([
             fmt_ts(created_at),
             fmt_ts(updated_at),
             fmt_ts(last_w),
-        ))
+        ])
+        pretty.append(tuple(row_out))
+
+    headers = ["discord_id", "address", "balance_hcc"]
+    if has_veco_internal:
+        headers.append("veco_internal")
+    if has_veco_deposit:
+        headers.append("veco_deposit_address")
+    if has_nns_internal:
+        headers.append("nns_internal")
+    if has_nns_deposit:
+        headers.append("nns_deposit_address")
+    headers.extend(["created_at", "updated_at", "last_withdraw_at"])
 
     print_table(
         "USERS (sorted by balance desc)",
-        ["discord_id", "address", "balance", "created_at", "updated_at", "last_withdraw_at"],
+        headers,
         pretty,
     )
 
@@ -190,6 +289,7 @@ def dump_tx_log(con: sqlite3.Connection, limit: int, only_type: Optional[str], o
     )
 
 
+
 def dump_swap_log(con: sqlite3.Connection, limit: int, only_status: Optional[str]) -> None:
     if not table_exists(con, "swap_log"):
         print("Table 'swap_log' not found.")
@@ -231,6 +331,114 @@ def dump_swap_log(con: sqlite3.Connection, limit: int, only_status: Optional[str
         cols,
         pretty_rows,
     )
+
+
+def dump_nns_stakes(con: sqlite3.Connection, limit: int) -> None:
+    if not table_exists(con, "nns_stakes"):
+        print("Table 'nns_stakes' not found.")
+        return
+
+    cols = table_columns(con, "nns_stakes")
+    order_col = first_existing(cols, ["updated_at", "created_at", "id", cols[0]]) or cols[0]
+
+    amount_col = first_existing(cols, [
+        "staked_sat",
+        "stake_sat",
+        "amount_sat",
+        "amount",
+        "staked_amount",
+        "stake_amount",
+        "principal_sat",
+        "principal",
+    ])
+
+    total_staked = None
+    if amount_col:
+        try:
+            row = con.execute(f"SELECT COALESCE(SUM({amount_col}), 0) FROM nns_stakes").fetchone()
+            total_staked = int((row[0] if row else 0) or 0)
+        except Exception:
+            total_staked = None
+
+    q = f"SELECT {', '.join(cols)} FROM nns_stakes ORDER BY {order_col} DESC LIMIT ?"
+    rows = fetch_all(con, q, (max(1, limit),))
+
+    pretty_rows: List[Tuple[Any, ...]] = []
+    for r in rows:
+        out: List[Any] = []
+        for i, v in enumerate(r):
+            cname = cols[i]
+            if cname in (
+                "ts", "created_at", "updated_at", "last_claim_at", "last_reward_at",
+                "started_at", "ends_at", "claimed_at", "last_accrual_ts",
+            ):
+                out.append(fmt_ts(v))
+            elif cname in ("note", "error"):
+                out.append(shorten(v, 60))
+            elif isinstance(v, str):
+                out.append(shorten(v, 60))
+            else:
+                out.append(v)
+        pretty_rows.append(tuple(out))
+
+    human_amount_cols = {
+        "staked_sat",
+        "stake_sat",
+        "amount_sat",
+        "staked_amount",
+        "stake_amount",
+        "principal_sat",
+        "accrued_reward_sat",
+    }
+
+    remainder_idx = cols.index("reward_remainder") if "reward_remainder" in cols else None
+    accrued_idx = cols.index("accrued_reward_sat") if "accrued_reward_sat" in cols else None
+
+    pretty_rows_hr: List[Tuple[Any, ...]] = []
+    for raw_row, display_row in zip(rows, pretty_rows):
+        out: List[Any] = []
+        for i, v in enumerate(display_row):
+            cname = cols[i]
+            if cname in human_amount_cols:
+                out.append(fmt_coin_sat(raw_row[i]))
+            elif cname == "reward_remainder":
+                out.append(str(raw_row[i] if raw_row[i] is not None else "0"))
+            else:
+                out.append(v)
+
+        if accrued_idx is not None and remainder_idx is not None:
+            try:
+                accrued_sat = Decimal(str(raw_row[accrued_idx] or 0))
+                remainder_sat = Decimal(str(raw_row[remainder_idx] or "0"))
+                total_pending_sat = accrued_sat + remainder_sat
+                out.append(fmt_coin_sat_decimal(total_pending_sat))
+            except Exception:
+                out.append("")
+        elif accrued_idx is not None:
+            try:
+                accrued_sat = Decimal(str(raw_row[accrued_idx] or 0))
+                out.append(fmt_coin_sat_decimal(accrued_sat))
+            except Exception:
+                out.append("")
+
+        pretty_rows_hr.append(tuple(out))
+
+    headers = []
+    for c in cols:
+        if c == "reward_remainder":
+            headers.append("reward_remainder_sat")
+        elif c.endswith("_sat"):
+            headers.append(c[:-4])
+        else:
+            headers.append(c)
+    if accrued_idx is not None:
+        headers.append("pending_reward")
+
+    shown_count = len(pretty_rows_hr)
+    title = f"NNS_STAKES (showing {shown_count} row(s))"
+    if total_staked is not None:
+        title += f" | total_staked={fmt_coin_sat(total_staked)} NNS"
+    print_table(title, headers, pretty_rows_hr)
 
 
 def dump_lottery_rounds(con: sqlite3.Connection, limit: int) -> None:
@@ -365,8 +573,9 @@ def main() -> None:
     ap.add_argument("--limits", action="store_true", help="Dump daily_limits table")
     ap.add_argument("--tx", action="store_true", help="Dump tx_log table")
     ap.add_argument("--swaps", action="store_true", help="Dump swap_log table (recent swaps)")
+    ap.add_argument("--nns-stakes", action="store_true", help="Dump nns_stakes table and show total NNS currently staked with the bot")
     ap.add_argument("--schema", action="store_true", help="Dump DB schema")
-    ap.add_argument("--limit", type=int, default=50, help="Limit rows (default: 50). For --tx this is last N entries.")
+    ap.add_argument("--limit", type=int, default=50, help="Limit rows (default: 50). Use 0 to show all rows. For --tx this is last N entries.")
     ap.add_argument("--tx-type", default="", help="Filter tx_log by type. Supports comma-separated values (e.g. tip,grant) or 'lottery' for lottery-related entries.")
     ap.add_argument("--tx-status", default="", help="Filter tx_log by status (ok|pending|failed)")
     ap.add_argument("--swap-status", default="", help="Filter swap_log by status if column exists")
@@ -383,14 +592,15 @@ def main() -> None:
         # Also dump dedicated lottery tables
         args.lottery_tables = True
 
-    # If no section chosen, dump everything
-    if not (args.users or args.limits or args.tx or args.swaps or args.schema or getattr(args, "lottery_tables", False)):
+    # If no section chosen, dump the common tables only.
+    # Lottery tables are intentionally excluded from the default dump and require flags.
+    if not (args.users or args.limits or args.tx or args.swaps or args.schema or args.nns_stakes or getattr(args, "lottery_tables", False)):
         args.schema = True
         args.users = True
         args.limits = True
         args.tx = True
         args.swaps = True
-        args.lottery_tables = True
+        args.nns_stakes = True
 
     con = sqlite3.connect(args.db)
     try:
@@ -414,6 +624,11 @@ def main() -> None:
                 limit=max(1, args.limit),
                 only_status=args.swap_status.strip() or None,
             )
+        if args.nns_stakes:
+            if args.limit and args.limit > 0:
+                dump_nns_stakes(con, limit=args.limit)
+            else:
+                dump_nns_stakes(con, limit=10**9)
         if getattr(args, "lottery_tables", False):
             dump_lottery_state(con)
             dump_lottery_rounds(con, limit=max(1, args.limit))

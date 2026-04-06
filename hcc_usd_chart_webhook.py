@@ -246,57 +246,6 @@ def render_hcc_usd_chart(samples: List[Sample]) -> bytes:
     return buf.getvalue()
 
 
-def render_hcc_pair_chart(samples: List[Sample]) -> bytes:
-    samples = sorted(samples, key=lambda s: s.ts)
-    xs = [datetime.fromtimestamp(s.ts, tz=timezone.utc) for s in samples]
-    ys_veco = [s.spot_veco for s in samples]
-    ys_nns = [s.spot_nns for s in samples]
-
-    fig = plt.figure(figsize=(7.6, 4.8), dpi=170, facecolor="#0f1117")
-    ax = fig.add_subplot(111, facecolor="#0f1117")
-
-    ax.plot(xs, ys_veco, "-", linewidth=2.2, color="#4aa3ff", alpha=0.95, label="HCC/VECO pool")
-    ax.plot(xs, ys_nns, "-", linewidth=2.2, color="#ffb347", alpha=0.95, label="HCC/NNS pool")
-
-    if ys_veco:
-        ax.scatter([xs[-1]], [ys_veco[-1]], s=60, color="#4aa3ff", zorder=6)
-    if ys_nns:
-        ax.scatter([xs[-1]], [ys_nns[-1]], s=60, color="#ffb347", zorder=6)
-
-    ax.set_title("HCC Pair Price", color="#eaeaea", fontsize=15, fontweight="bold", pad=10)
-    ax.set_ylabel("Quote asset per HCC", color="#d6d6d6", fontsize=12)
-    ax.set_xlabel("Time (UTC)", color="#d6d6d6", fontsize=12)
-
-    locator = mdates.AutoDateLocator(minticks=4, maxticks=8)
-    formatter = mdates.DateFormatter("%H:%M")
-    ax.xaxis.set_major_locator(locator)
-    ax.xaxis.set_major_formatter(formatter)
-    fig.autofmt_xdate(rotation=30, ha="right")
-
-    ax.tick_params(axis="x", colors="#cfcfcf", labelsize=10)
-    ax.tick_params(axis="y", colors="#cfcfcf", labelsize=10)
-
-    ax.grid(True, axis="y", linestyle="-", linewidth=1.0, alpha=0.18)
-    ax.grid(True, axis="x", linestyle=":", linewidth=0.8, alpha=0.10)
-
-    all_ys = [y for y in (ys_veco + ys_nns) if y is not None]
-    if all_ys:
-        y_min, y_max = min(all_ys), max(all_ys)
-        span = y_max - y_min
-        pad = span * 0.25 if span > 0 else max(1e-6, y_max * 0.10 if y_max > 0 else 1e-6)
-        ax.set_ylim(y_min - pad, y_max + pad)
-
-    leg = ax.legend(loc="best", frameon=True)
-    leg.get_frame().set_facecolor("#0f1117")
-    leg.get_frame().set_alpha(0.65)
-    for text in leg.get_texts():
-        text.set_color("#eaeaea")
-
-    fig.tight_layout()
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    return buf.getvalue()
 
 
 def load_message_id_from_state(state_path: Path) -> Optional[str]:
@@ -562,19 +511,18 @@ def main() -> int:
             print(("OK: " if ok else "ERROR: ") + info)
         return 0
 
-    # --- render charts ---
+    # --- render chart ---
     png_usd = render_hcc_usd_chart(samples)
-    png_pairs = render_hcc_pair_chart(samples)
 
     # Discord text
     last = max(samples, key=lambda s: s.ts)
     window_hours = window_seconds / 3600.0
     content = (
-        f"**HCC price charts**\n"
+        f"**HCC/USD price chart**\n"
         f"Window: last **{window_hours:.1f} h** • Samples: **{len(samples)}**\n"
         f"HCC/VECO: **{last.spot_veco:.6f} VECO per HCC**\n"
-        f"HCC/NNS: **{last.spot_nns:.6f} NNS per HCC**\n"
-        f"VECO: **{last.veco_usd:.6f} USD** • HCC/USD: **{last.hcc_usd:.8f} USD**\n"
+        f"VECO: **{last.veco_usd:.6f} USD**\n"
+        f"HCC/USD: **{last.hcc_usd:.8f} USD**\n"
         f"Last update: {fmt_utc(last.ts)}"
     )
 
@@ -582,10 +530,7 @@ def main() -> int:
         ok, info = discord_webhook_post_or_patch(
             webhook_url,
             message_id,
-            [
-                ("hcc_usd_chart.png", png_usd, "image/png"),
-                ("hcc_pair_chart.png", png_pairs, "image/png"),
-            ],
+            [("hcc_usd_chart.png", png_usd, "image/png")],
             content,
             username=username,
             avatar_url=avatar_url,
@@ -600,10 +545,7 @@ def main() -> int:
                 ok, info = discord_webhook_post_or_patch(
                     webhook_url,
                     None,
-                    [
-                        ("hcc_usd_chart.png", png_usd, "image/png"),
-                        ("hcc_pair_chart.png", png_pairs, "image/png"),
-                    ],
+                    [("hcc_usd_chart.png", png_usd, "image/png")],
                     content,
                     username=username,
                     avatar_url=avatar_url,
