@@ -32,7 +32,12 @@ WITHDRAW_BATCH = int(os.environ.get("NNS_WITHDRAW_BATCH", "10"))
 NNS_WITHDRAW_FEE_ADDRESS = os.environ.get("NNS_WITHDRAW_FEE_ADDRESS", "").strip()
 
 DEPOSIT_REFRESH_BATCH = int(os.environ.get("NNS_DEPOSIT_REFRESH_BATCH", "200"))
+
 WITHDRAW_SLEEP_BETWEEN = float(os.environ.get("NNS_WITHDRAW_SLEEP", "0.2"))
+
+EXPLORER_SENDRAWTX_URL = os.environ.get("EXPLORER_SENDRAWTX_URL", "").strip()
+EXPLORER_TX_API_KEY = os.environ.get("EXPLORER_TX_API_KEY", "").strip()
+EXPLORER_REBROADCAST_TIMEOUT = int(os.environ.get("EXPLORER_REBROADCAST_TIMEOUT", "20"))
 
 
 # ---------------------------
@@ -136,6 +141,52 @@ async def nns_rpc_call(method: str, params: Optional[List[Any]] = None) -> Any:
             if data.get("error"):
                 raise RuntimeError(f"996-Coin RPC error: {data['error']}")
             return data.get("result")
+
+
+# ---------------------------
+# Explorer rebroadcast helpers
+# ---------------------------
+
+async def get_raw_tx_hex(txid: str) -> str:
+    """
+    Fetch the wallet transaction and return its raw hex for best-effort rebroadcast.
+    """
+    res = await nns_rpc_call("gettransaction", [str(txid), True])
+    if not isinstance(res, dict):
+        raise RuntimeError("gettransaction returned invalid result")
+    raw_hex = str(res.get("hex") or "").strip()
+    if not raw_hex:
+        raise RuntimeError("transaction hex not available from gettransaction")
+    return raw_hex
+
+
+async def explorer_rebroadcast_raw_tx(raw_hex: str) -> Dict[str, Any]:
+    """
+    Best-effort rebroadcast via explorer backend.
+    Returns the parsed JSON response. Raises on transport or HTTP errors.
+    """
+    if not EXPLORER_SENDRAWTX_URL:
+        raise RuntimeError("EXPLORER_SENDRAWTX_URL not configured")
+
+    headers = {"Content-Type": "application/json"}
+    if EXPLORER_TX_API_KEY:
+        headers["X-API-Key"] = EXPLORER_TX_API_KEY
+
+    payload: Dict[str, Any] = {"hex": str(raw_hex).strip()}
+
+    timeout = aiohttp.ClientTimeout(total=EXPLORER_REBROADCAST_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(EXPLORER_SENDRAWTX_URL, json=payload, headers=headers) as r:
+            txt = await r.text()
+            if r.status >= 400:
+                raise RuntimeError(f"explorer rebroadcast HTTP {r.status}: {txt}")
+            try:
+                data = json.loads(txt)
+            except Exception as e:
+                raise RuntimeError(f"explorer rebroadcast returned invalid JSON: {e}")
+            if not isinstance(data, dict):
+                raise RuntimeError("explorer rebroadcast returned invalid response type")
+            return data
 
 
 def load_address_map(con: sqlite3.Connection) -> Dict[str, int]:
@@ -337,6 +388,7 @@ async def process_withdrawals() -> Tuple[int, int]:
 
         txid: Optional[str] = None
         err: Optional[str] = None
+        rebroadcast_note: Optional[str] = None
         try:
             amount_str = format_sat_to_nns(amount_sat)
 
@@ -355,6 +407,17 @@ async def process_withdrawals() -> Tuple[int, int]:
             if not isinstance(txid, str) or not txid.strip():
                 raise RuntimeError("withdraw broadcast returned invalid txid")
             txid = txid.strip()
+
+            if EXPLORER_SENDRAWTX_URL:
+                try:
+                    raw_hex = await get_raw_tx_hex(txid)
+                    explorer_res = await explorer_rebroadcast_raw_tx(raw_hex)
+                    if explorer_res.get("ok") is True:
+                        rebroadcast_note = f"explorer rebroadcast ok txid={explorer_res.get('txid', txid)}"
+                    else:
+                        rebroadcast_note = f"explorer rebroadcast not ok: {explorer_res.get('error', 'unknown error')}"
+                except Exception as re:
+                    rebroadcast_note = f"explorer rebroadcast failed: {str(re)[:300]}"
         except Exception as e:
             err = str(e)[:500]
 
@@ -380,11 +443,13 @@ async def process_withdrawals() -> Tuple[int, int]:
 
             if txid:
                 con2.execute(
-                    "UPDATE nns_withdrawals SET status='sent', txid=?, error=NULL WHERE id=?",
-                    (txid, wid)
+                    "UPDATE nns_withdrawals SET status='sent', txid=?, error=? WHERE id=?",
+                    (txid, rebroadcast_note, wid)
                 )
                 con2.execute("COMMIT;")
                 sent += 1
+                if rebroadcast_note:
+                    print(f"[withdraw {wid}] {rebroadcast_note}", flush=True)
             else:
                 con2.execute(
                     "UPDATE nns_withdrawals SET status='failed', error=? WHERE id=?",

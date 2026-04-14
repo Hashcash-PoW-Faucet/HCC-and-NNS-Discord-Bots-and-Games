@@ -101,6 +101,116 @@ def first_existing(cols: List[str], candidates: List[str]) -> Optional[str]:
     return None
 
 
+def dump_deposits(con: sqlite3.Connection, limit: int, only_coin: Optional[str], only_status: Optional[str]) -> None:
+    candidate_tables = [
+        ("deposits", None),
+        ("deposit_log", None),
+        ("veco_deposits", "VECO"),
+        ("nns_deposits", "NNS"),
+    ]
+
+    found_any = False
+    wanted_coin = (str(only_coin).strip().upper() if only_coin else None)
+
+    for table_name, fixed_coin in candidate_tables:
+        if not table_exists(con, table_name):
+            continue
+
+        if wanted_coin and fixed_coin and wanted_coin != fixed_coin:
+            continue
+
+        found_any = True
+        cols = table_columns(con, table_name)
+        order_col = first_existing(cols, ["id", "ts", "created_at", "updated_at", "first_seen_ts", "last_update_ts", cols[0]]) or cols[0]
+
+        coin_col = first_existing(cols, ["coin", "currency", "symbol"])
+        status_col = first_existing(cols, ["status", "state", "credited"])
+
+        amount_sat_col = first_existing(cols, [
+            "amount_sat",
+            "credited_sat",
+            "value_sat",
+            "nns_amount_sat",
+            "veco_amount_sat",
+        ])
+        amount_dec_col = first_existing(cols, [
+            "amount",
+            "credited_amount",
+            "value",
+        ])
+
+        where = []
+        params: List[Any] = []
+
+        if wanted_coin and coin_col:
+            where.append(f"UPPER({coin_col}) = ?")
+            params.append(wanted_coin)
+
+        if only_status and status_col:
+            status_value = str(only_status).strip()
+            if status_col == "credited":
+                sv = status_value.lower()
+                if sv in ("credited", "ok", "true", "yes", "1"):
+                    where.append("credited = 1")
+                elif sv in ("pending", "uncredited", "false", "no", "0"):
+                    where.append("credited = 0")
+                else:
+                    where.append("credited = ?")
+                    params.append(status_value)
+            else:
+                where.append(f"{status_col} = ?")
+                params.append(status_value)
+
+        wsql = ("WHERE " + " AND ".join(where)) if where else ""
+
+        q = f"SELECT {', '.join(cols)} FROM {table_name} {wsql} ORDER BY {order_col} DESC LIMIT ?"
+        params.append(limit)
+        rows = fetch_all(con, q, tuple(params))
+
+        pretty_rows: List[Tuple[Any, ...]] = []
+        for r in rows:
+            out: List[Any] = []
+            for i, v in enumerate(r):
+                cname = cols[i]
+                if cname in ("ts", "created_at", "updated_at", "first_seen_ts", "last_seen_ts", "credited_at", "credited_ts", "last_update_ts"):
+                    out.append(fmt_ts(v))
+                elif amount_sat_col and cname == amount_sat_col:
+                    out.append(fmt_coin_sat(v))
+                elif amount_dec_col and cname == amount_dec_col:
+                    out.append(str(v if v is not None else ""))
+                elif cname == "credited":
+                    out.append("credited" if int(v or 0) else "pending")
+                elif cname in ("note", "error", "txid", "address", "deposit_address"):
+                    out.append(shorten(v, 60))
+                elif isinstance(v, str):
+                    out.append(shorten(v, 60))
+                else:
+                    out.append(v)
+            if fixed_coin and "coin" not in cols and "currency" not in cols and "symbol" not in cols:
+                out.insert(0, fixed_coin)
+            pretty_rows.append(tuple(out))
+
+        headers = []
+        if fixed_coin and "coin" not in cols and "currency" not in cols and "symbol" not in cols:
+            headers.append("coin")
+        for c in cols:
+            if c == "credited":
+                headers.append("status")
+            elif c.endswith("_sat"):
+                headers.append(c[:-4])
+            else:
+                headers.append(c)
+
+        print_table(
+            f"{table_name.upper()} (last {limit})",
+            headers,
+            pretty_rows,
+        )
+
+    if not found_any:
+        print("No deposit tables found. Looked for: deposits, deposit_log, veco_deposits, nns_deposits.")
+
+
 
 def dump_users(con: sqlite3.Connection, limit: Optional[int]) -> None:
     if not table_exists(con, "users"):
@@ -573,6 +683,9 @@ def main() -> None:
     ap.add_argument("--limits", action="store_true", help="Dump daily_limits table")
     ap.add_argument("--tx", action="store_true", help="Dump tx_log table")
     ap.add_argument("--swaps", action="store_true", help="Dump swap_log table (recent swaps)")
+    ap.add_argument("--deposits", action="store_true", help="Dump deposits / deposit_log table (recent deposits)")
+    ap.add_argument("--deposit-coin", default="", help="Filter deposits by coin/currency if such a column exists")
+    ap.add_argument("--deposit-status", default="", help="Filter deposits by status/state if such a column exists")
     ap.add_argument("--nns-stakes", action="store_true", help="Dump nns_stakes table and show total NNS currently staked with the bot")
     ap.add_argument("--schema", action="store_true", help="Dump DB schema")
     ap.add_argument("--limit", type=int, default=50, help="Limit rows (default: 50). Use 0 to show all rows. For --tx this is last N entries.")
@@ -594,12 +707,13 @@ def main() -> None:
 
     # If no section chosen, dump the common tables only.
     # Lottery tables are intentionally excluded from the default dump and require flags.
-    if not (args.users or args.limits or args.tx or args.swaps or args.schema or args.nns_stakes or getattr(args, "lottery_tables", False)):
+    if not (args.users or args.limits or args.tx or args.swaps or args.deposits or args.schema or args.nns_stakes or getattr(args, "lottery_tables", False)):
         args.schema = True
         args.users = True
         args.limits = True
         args.tx = True
         args.swaps = True
+        args.deposits = True
         args.nns_stakes = True
 
     con = sqlite3.connect(args.db)
@@ -623,6 +737,13 @@ def main() -> None:
                 con,
                 limit=max(1, args.limit),
                 only_status=args.swap_status.strip() or None,
+            )
+        if args.deposits:
+            dump_deposits(
+                con,
+                limit=max(1, args.limit),
+                only_coin=args.deposit_coin.strip() or None,
+                only_status=args.deposit_status.strip() or None,
             )
         if args.nns_stakes:
             if args.limit and args.limit > 0:

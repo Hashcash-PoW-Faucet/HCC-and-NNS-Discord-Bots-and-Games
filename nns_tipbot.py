@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import sqlite3
 from typing import Optional, Dict, Any, List
@@ -24,7 +25,22 @@ DB_PATH = os.environ.get("TIPBOT_DB", "tipbot.db").strip()
 GUILD_ID = os.environ.get("NNS_TIPBOT_GUILD_ID", "").strip()
 
 # Public announcements
+
 PUBLIC_TIP_ANNOUNCEMENTS = os.environ.get("NNS_TIPBOT_PUBLIC_TIP_ANNOUNCEMENTS", "1").strip() == "1"
+# Optional role restriction: only members with one of these roles may use the bot.
+# You can configure role IDs and/or exact role names as comma-separated lists.
+NNS_TIPBOT_ALLOWED_ROLE_IDS = {
+    int(x.strip())
+    for x in os.environ.get("NNS_TIPBOT_ALLOWED_ROLE_IDS", "").split(",")
+    if x.strip().isdigit()
+}
+NNS_TIPBOT_ALLOWED_ROLE_NAMES = {
+    x.strip().lower()
+    for x in os.environ.get("NNS_TIPBOT_ALLOWED_ROLE_NAMES", "").split(",")
+    if x.strip()
+}
+print(f"[nns_tipbot] allowed role ids: {sorted(NNS_TIPBOT_ALLOWED_ROLE_IDS)}")
+print(f"[nns_tipbot] allowed role names: {sorted(NNS_TIPBOT_ALLOWED_ROLE_NAMES)}")
 
 # NNS RPC (only needed for getnewaddress)
 NNS_RPC_URL = os.environ.get("NNS_RPC_URL", "http://127.0.0.1:19996/").strip()
@@ -52,7 +68,16 @@ if NNS_STAKING_APR < Decimal("0"):
     NNS_STAKING_APR = Decimal("0")
 elif NNS_STAKING_APR > Decimal("1000"):
     NNS_STAKING_APR = Decimal("1000")
+NNS_STAKING_BLOCK_TIME_SECONDS = int(os.environ.get("NNS_STAKING_BLOCK_TIME_SECONDS", "180"))
+NNS_STAKING_APR_FACTOR = Decimal(os.environ.get("NNS_STAKING_APR_FACTOR", "0.75").strip() or "0.75")
+if NNS_STAKING_APR_FACTOR < Decimal("0"):
+    NNS_STAKING_APR_FACTOR = Decimal("0")
+elif NNS_STAKING_APR_FACTOR > Decimal("1"):
+    NNS_STAKING_APR_FACTOR = Decimal("1")
+CURRENT_NNS_STAKING_APR = NNS_STAKING_APR
 NNS_STAKING_INTERVAL_SECONDS = int(os.environ.get("NNS_STAKING_INTERVAL_SECONDS", "180"))
+NNS_STAKING_APR_REFRESH_SECONDS = int(os.environ.get("NNS_STAKING_APR_REFRESH_SECONDS", "1800"))
+NNS_STAKING_APR_CACHE_FILE = os.environ.get("NNS_STAKING_APR_CACHE_FILE", "nns_staking_apr.json").strip()
 SECONDS_PER_YEAR = Decimal("31536000")
 
 
@@ -78,6 +103,7 @@ def parse_nns_to_sat(s: str) -> int:
     return sat
 
 
+
 def compute_nns_withdraw_fee_sat(amount_sat: int) -> int:
     bps = int(NNS_WITHDRAW_FEE_BPS)
     if bps <= 0:
@@ -86,6 +112,66 @@ def compute_nns_withdraw_fee_sat(amount_sat: int) -> int:
     if fee <= 0 < int(amount_sat):
         fee = 1
     return int(fee)
+
+
+def get_current_staking_apr() -> Decimal:
+    apr = CURRENT_NNS_STAKING_APR
+    if apr < Decimal("0"):
+        return Decimal("0")
+    if apr > Decimal("1000"):
+        return Decimal("1000")
+    return apr
+
+
+def write_staking_apr_cache(apr: Decimal) -> None:
+    path = (NNS_STAKING_APR_CACHE_FILE or "").strip()
+    if not path:
+        return
+
+    payload = {
+        "apr_percent": float(apr),
+        "updated_at": now_ts(),
+        "apr_factor": float(NNS_STAKING_APR_FACTOR),
+        "block_time_seconds": int(NNS_STAKING_BLOCK_TIME_SECONDS),
+    }
+
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp_path, path)
+
+
+async def refresh_dynamic_staking_apr() -> Decimal:
+    global CURRENT_NNS_STAKING_APR
+
+    try:
+        mining = await nns_rpc_call("getmininginfo")
+        blockchain = await nns_rpc_call("getblockchaininfo")
+
+        block_value_sat = Decimal(str(mining.get("blockvalue", 0) or 0))
+        money_supply = Decimal(str(blockchain.get("moneysupply", 0) or 0))
+        block_time_seconds = max(1, int(NNS_STAKING_BLOCK_TIME_SECONDS))
+
+        if block_value_sat <= 0 or money_supply <= 0:
+            return CURRENT_NNS_STAKING_APR
+
+        block_reward_coins = block_value_sat / Decimal(NNS_SATS)
+        blocks_per_year = SECONDS_PER_YEAR / Decimal(block_time_seconds)
+        calculated_apr = (block_reward_coins * blocks_per_year / money_supply) * Decimal("100")
+        effective_apr = calculated_apr * NNS_STAKING_APR_FACTOR
+
+        if effective_apr < Decimal("0"):
+            effective_apr = Decimal("0")
+        elif effective_apr > Decimal("1000"):
+            effective_apr = Decimal("1000")
+
+        CURRENT_NNS_STAKING_APR = effective_apr
+        write_staking_apr_cache(CURRENT_NNS_STAKING_APR)
+        return CURRENT_NNS_STAKING_APR
+    except Exception as e:
+        print(f"[nns_tipbot] dynamic APR refresh failed: {e}")
+        return CURRENT_NNS_STAKING_APR
 
 
 def db() -> sqlite3.Connection:
@@ -274,6 +360,70 @@ def has_pending_nns_withdraw(con: sqlite3.Connection, discord_id: int) -> bool:
     return bool(row)
 
 
+# Role gate helper
+def get_role_gate_error(interaction: discord.Interaction) -> Optional[str]:
+    # No restriction configured.
+    if not NNS_TIPBOT_ALLOWED_ROLE_IDS and not NNS_TIPBOT_ALLOWED_ROLE_NAMES:
+        return None
+
+    # Guild admins / managers always bypass the role gate.
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if perms and (getattr(perms, "administrator", False) or getattr(perms, "manage_guild", False)):
+        return None
+
+    guild = getattr(interaction, "guild", None)
+    member = None
+
+    # Prefer a real guild member object, because component interactions / persistent views
+    # can sometimes be awkward depending on cache state.
+    if guild is not None:
+        try:
+            member = guild.get_member(int(interaction.user.id))
+        except Exception:
+            member = None
+
+    if member is None:
+        member = interaction.user
+
+    roles = getattr(member, "roles", None)
+    if roles is None:
+        print(f"[nns_tipbot] role gate: no roles available for user {getattr(interaction.user, 'id', '?')}")
+        return "This bot can only be used inside the server by members with an allowed role."
+
+    matched_role = None
+    role_ids = []
+    role_names = []
+
+    for role in roles:
+        try:
+            rid = int(role.id)
+            role_ids.append(rid)
+            if rid in NNS_TIPBOT_ALLOWED_ROLE_IDS:
+                matched_role = f"id:{rid}"
+                break
+        except Exception:
+            pass
+        try:
+            rname = str(role.name).strip().lower()
+            role_names.append(rname)
+            if rname in NNS_TIPBOT_ALLOWED_ROLE_NAMES:
+                matched_role = f"name:{rname}"
+                break
+        except Exception:
+            pass
+
+    if matched_role is not None:
+        print(
+            f"[nns_tipbot] role gate allow user={int(interaction.user.id)} matched={matched_role} roles={role_ids} role_names={role_names}"
+        )
+        return None
+
+    print(
+        f"[nns_tipbot] role gate deny user={int(interaction.user.id)} roles={role_ids} role_names={role_names} allowed_ids={sorted(NNS_TIPBOT_ALLOWED_ROLE_IDS)} allowed_names={sorted(NNS_TIPBOT_ALLOWED_ROLE_NAMES)}"
+    )
+    return "You are not allowed to participate in this airdrop. Please get verified first. See the how-to channel for details."
+
+
 def is_admin(interaction: discord.Interaction, con: Optional[sqlite3.Connection] = None) -> bool:
     perms = getattr(interaction.user, "guild_permissions", None)
     if perms and (getattr(perms, "administrator", False) or getattr(perms, "manage_guild", False)):
@@ -370,9 +520,11 @@ def accrue_stake_position(con: sqlite3.Connection, discord_id: int, ts_now: Opti
     reward_sat_to_add = 0
     new_remainder = reward_remainder
 
-    if staked_sat > 0 and NNS_STAKING_APR > 0:
+    current_apr = get_current_staking_apr()
+
+    if staked_sat > 0 and current_apr > 0:
         raw_reward = (
-            (Decimal(staked_sat) * NNS_STAKING_APR * Decimal(elapsed))
+            (Decimal(staked_sat) * current_apr * Decimal(elapsed))
             / Decimal("100")
             / SECONDS_PER_YEAR
         )
@@ -669,7 +821,21 @@ class NNSTipBot(discord.Client):
 
         self.loop.create_task(self.airdrop_expiry_loop())
         if NNS_STAKING_ENABLED:
+            await refresh_dynamic_staking_apr()
+            write_staking_apr_cache(get_current_staking_apr())
+            self.loop.create_task(self.staking_apr_refresh_loop())
             self.loop.create_task(self.staking_accrual_loop())
+    async def staking_apr_refresh_loop(self):
+        await self.wait_until_ready()
+        await asyncio.sleep(25)
+        interval = max(300, int(NNS_STAKING_APR_REFRESH_SECONDS))
+        while not self.is_closed():
+            try:
+                apr = await refresh_dynamic_staking_apr()
+                print(f"[staking_apr_refresh_loop] current APR set to {apr}%")
+            except Exception as e:
+                print(f"[staking_apr_refresh_loop] {e}")
+            await asyncio.sleep(interval)
 
     async def airdrop_expiry_loop(self):
         await self.wait_until_ready()
@@ -711,6 +877,11 @@ class AirdropClaimView(ui.View):
 
     async def claim_callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
+        role_gate_error = get_role_gate_error(interaction)
+        if role_gate_error:
+            print(f"[nns_tipbot] denied airdrop claim airdrop_id={self.airdrop_id} user={int(interaction.user.id)}")
+            await interaction.followup.send(role_gate_error, ephemeral=True)
+            return
 
         con = db()
         try:
@@ -835,19 +1006,23 @@ async def help_cmd(interaction: discord.Interaction):
         "• Deposits and withdrawals are processed by the existing NNS watcher.\n"
         "• This bot only writes to the shared TipBot database.\n"
         "• Airdrops credit internal NNS balances when users click the button.\n"
-        f"• Staking APR: **{NNS_STAKING_APR}%** yearly.\n"
+        f"• Staking APR: **{get_current_staking_apr():.4f}%** yearly (auto-adjusted).\n"
+        f"• APR refresh interval: **{max(300, int(NNS_STAKING_APR_REFRESH_SECONDS))} seconds**.\n"
+        f"• APR cache file: **{NNS_STAKING_APR_CACHE_FILE}**.\n"
     )
     await interaction.response.send_message(text, ephemeral=True)
 
 
 @bot.tree.command(name="balances", description="Show your internal NNS balance.")
 async def balances(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=False)
+
     con = db()
     try:
         u = get_or_create_user(con, interaction.user.id)
         bal = int(u.get("nns_internal_sat") or 0)
         dep = u.get("nns_deposit_address") or "(not created)"
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"NNS (internal): **{format_sat_to_nns(bal)}**\n"
             f"NNS deposit address: `{dep}`",
             ephemeral=True,
@@ -1258,6 +1433,10 @@ async def multitip(interaction: discord.Interaction, amount: str, users: str, no
 )
 async def start_airdrop(interaction: discord.Interaction, per_user: str, limit: int, duration_min: Optional[int] = None):
     await interaction.response.defer(ephemeral=True, thinking=True)
+    role_gate_error = get_role_gate_error(interaction)
+    if role_gate_error:
+        await interaction.followup.send(role_gate_error, ephemeral=True)
+        return
 
     try:
         per_user_sat = parse_nns_to_sat(per_user)
@@ -1453,6 +1632,10 @@ async def list_airdrops(interaction: discord.Interaction):
 @app_commands.describe(airdrop_id="Airdrop id")
 async def end_airdrop(interaction: discord.Interaction, airdrop_id: int):
     await interaction.response.defer(ephemeral=True, thinking=True)
+    role_gate_error = get_role_gate_error(interaction)
+    if role_gate_error:
+        await interaction.followup.send(role_gate_error, ephemeral=True)
+        return
 
     con = db()
     refund_sat = 0
@@ -1535,7 +1718,7 @@ async def stake_balance(interaction: discord.Interaction):
     await interaction.followup.send(
         f"Staked: **{format_sat_to_nns(int(stake['staked_sat']))} NNS**\n"
         f"Accrued reward: **{format_sat_to_nns(int(stake['accrued_reward_sat']))} NNS**\n"
-        f"APR: **{NNS_STAKING_APR}%**",
+        f"APR: **{get_current_staking_apr():.4f}%** (auto-adjusted)",
         ephemeral=True,
     )
 

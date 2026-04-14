@@ -30,7 +30,6 @@ POLL_SECONDS = int(os.environ.get("VECO_POLL_SECONDS", "15"))
 LOG_HEARTBEAT_SECONDS = int(os.environ.get("VECO_LOG_HEARTBEAT_SECONDS", "600"))
 WITHDRAW_BATCH = int(os.environ.get("VECO_WITHDRAW_BATCH", "10"))
 
-VECO_WITHDRAW_FEE_ADDRESS = os.environ.get("VECO_WITHDRAW_FEE_ADDRESS", "").strip()
 
 # How many uncredited deposits to refresh per loop (for confirmations)
 DEPOSIT_REFRESH_BATCH = int(os.environ.get("VECO_DEPOSIT_REFRESH_BATCH", "200"))
@@ -381,21 +380,10 @@ async def process_withdrawals() -> Tuple[int, int]:
         txid: Optional[str] = None
         err: Optional[str] = None
         try:
+            # `amount_sat` already stores the net user amount after fee deduction in the tipbot.
+            # Send only this net amount on-chain and keep the fee implicitly in the hot wallet.
             amount_str = format_sat_to_veco(amount_sat)
-
-            if fee_sat > 0:
-                if not VECO_WITHDRAW_FEE_ADDRESS:
-                    raise RuntimeError("withdraw fee is set but VECO_WITHDRAW_FEE_ADDRESS is not configured")
-                fee_str = format_sat_to_veco(fee_sat)
-                outputs = {
-                    str(to_addr): float(amount_str),
-                    str(VECO_WITHDRAW_FEE_ADDRESS): float(fee_str),
-                }
-                # sendmany "" {address: amount, ...}
-                txid = await veco_rpc_call("sendmany", ["", outputs])
-            else:
-                # sendtoaddress <address> <amount>
-                txid = await veco_rpc_call("sendtoaddress", [to_addr, amount_str])
+            txid = await veco_rpc_call("sendtoaddress", [to_addr, amount_str])
 
             if not isinstance(txid, str) or not txid.strip():
                 raise RuntimeError("withdraw broadcast returned invalid txid")
