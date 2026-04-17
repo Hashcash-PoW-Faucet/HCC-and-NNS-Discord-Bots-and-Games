@@ -54,7 +54,47 @@ NNS_MIN_WITHDRAW_SAT = int(Decimal(os.environ.get("NNS_MIN_WITHDRAW", "0.1000000
 NNS_WITHDRAW_FEE_BPS = int(os.environ.get("NNS_WITHDRAW_FEE_BPS", "0"))
 NNS_WITHDRAW_FEE_ADDRESS = os.environ.get("NNS_WITHDRAW_FEE_ADDRESS", "").strip()
 
+
 NNS_SATS = 100_000_000
+
+NNS_CLAIM_ENABLED = os.environ.get("NNS_CLAIM_ENABLED", "1").strip() == "1"
+NNS_CLAIM_AMOUNT_SAT = int(Decimal(os.environ.get("NNS_CLAIM_AMOUNT", "0.96600000")).quantize(
+    Decimal("0.00000001"), rounding=ROUND_DOWN
+) * Decimal("100000000"))
+NNS_CLAIM_COOLDOWN_SECONDS = int(os.environ.get("NNS_CLAIM_COOLDOWN_SECONDS", str(60 * 60)))
+NNS_LEVEL_XP_THRESHOLDS = [0, 50, 125, 225, 350, 500, 700, 950, 1250, 1600]
+NNS_LEVEL_CLAIM_MULTIPLIERS = {
+    1: Decimal("1.00"),
+    2: Decimal("1.10"),
+    3: Decimal("1.20"),
+    4: Decimal("1.30"),
+    5: Decimal("1.40"),
+    6: Decimal("1.50"),
+    7: Decimal("1.60"),
+    8: Decimal("1.70"),
+    9: Decimal("1.80"),
+    10: Decimal("2.00"),
+}
+
+NNS_XP_CLAIM = 5
+NNS_XP_TIP = 4
+NNS_XP_MULTITIP = 6
+NNS_XP_AIRDROP_CLAIM = 3
+NNS_XP_AIRDROP_CREATE = 8
+NNS_XP_STAKE = 3
+NNS_XP_CLAIM_STAKING = 2
+
+NNS_XP_MIN_TIP_SAT = int(Decimal("10.00000000") * Decimal(NNS_SATS))
+NNS_XP_MIN_STAKE_SAT = int(Decimal("10.00000000") * Decimal(NNS_SATS))
+NNS_XP_TIP_DAILY_CAP = 5
+NNS_XP_MULTITIP_DAILY_CAP = 5
+NNS_XP_AIRDROP_CLAIM_DAILY_CAP = 5
+NNS_XP_AIRDROP_CREATE_DAILY_CAP = 2
+NNS_XP_STAKE_DAILY_CAP = 2
+
+NNS_XP_CLAIM_STAKING_DAILY_CAP = 3
+
+NNS_XP_DONATION_BOT_USER_ID = int(os.environ.get("NNS_XP_DONATION_BOT_USER_ID", "0").strip() or "0")
 
 
 # Airdrop config
@@ -63,18 +103,18 @@ NNS_AIRDROP_MAX_RECIPIENTS = int(os.environ.get("NNS_AIRDROP_MAX_RECIPIENTS", "2
 
 # Staking config
 NNS_STAKING_ENABLED = os.environ.get("NNS_STAKING_ENABLED", "0").strip() == "1"
-NNS_STAKING_APR = Decimal(os.environ.get("NNS_STAKING_APR", "0").strip() or "0")
-if NNS_STAKING_APR < Decimal("0"):
-    NNS_STAKING_APR = Decimal("0")
-elif NNS_STAKING_APR > Decimal("1000"):
-    NNS_STAKING_APR = Decimal("1000")
+NNS_STAKING_APR_FALLBACK = Decimal(os.environ.get("NNS_STAKING_APR_FALLBACK", "0").strip() or "0")
+if NNS_STAKING_APR_FALLBACK < Decimal("0"):
+    NNS_STAKING_APR_FALLBACK = Decimal("0")
+elif NNS_STAKING_APR_FALLBACK > Decimal("1000"):
+    NNS_STAKING_APR_FALLBACK = Decimal("1000")
 NNS_STAKING_BLOCK_TIME_SECONDS = int(os.environ.get("NNS_STAKING_BLOCK_TIME_SECONDS", "180"))
 NNS_STAKING_APR_FACTOR = Decimal(os.environ.get("NNS_STAKING_APR_FACTOR", "0.75").strip() or "0.75")
 if NNS_STAKING_APR_FACTOR < Decimal("0"):
     NNS_STAKING_APR_FACTOR = Decimal("0")
 elif NNS_STAKING_APR_FACTOR > Decimal("1"):
     NNS_STAKING_APR_FACTOR = Decimal("1")
-CURRENT_NNS_STAKING_APR = NNS_STAKING_APR
+CURRENT_NNS_STAKING_APR = NNS_STAKING_APR_FALLBACK
 NNS_STAKING_INTERVAL_SECONDS = int(os.environ.get("NNS_STAKING_INTERVAL_SECONDS", "180"))
 NNS_STAKING_APR_REFRESH_SECONDS = int(os.environ.get("NNS_STAKING_APR_REFRESH_SECONDS", "1800"))
 NNS_STAKING_APR_CACHE_FILE = os.environ.get("NNS_STAKING_APR_CACHE_FILE", "nns_staking_apr.json").strip()
@@ -123,54 +163,29 @@ def get_current_staking_apr() -> Decimal:
     return apr
 
 
-def write_staking_apr_cache(apr: Decimal) -> None:
-    path = (NNS_STAKING_APR_CACHE_FILE or "").strip()
-    if not path:
-        return
-
-    payload = {
-        "apr_percent": float(apr),
-        "updated_at": now_ts(),
-        "apr_factor": float(NNS_STAKING_APR_FACTOR),
-        "block_time_seconds": int(NNS_STAKING_BLOCK_TIME_SECONDS),
-    }
-
-    tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    os.replace(tmp_path, path)
-
-
 async def refresh_dynamic_staking_apr() -> Decimal:
     global CURRENT_NNS_STAKING_APR
 
     try:
-        mining = await nns_rpc_call("getmininginfo")
-        blockchain = await nns_rpc_call("getblockchaininfo")
-
-        block_value_sat = Decimal(str(mining.get("blockvalue", 0) or 0))
-        money_supply = Decimal(str(blockchain.get("moneysupply", 0) or 0))
-        block_time_seconds = max(1, int(NNS_STAKING_BLOCK_TIME_SECONDS))
-
-        if block_value_sat <= 0 or money_supply <= 0:
+        path = (NNS_STAKING_APR_CACHE_FILE or "").strip()
+        if not path:
             return CURRENT_NNS_STAKING_APR
 
-        block_reward_coins = block_value_sat / Decimal(NNS_SATS)
-        blocks_per_year = SECONDS_PER_YEAR / Decimal(block_time_seconds)
-        calculated_apr = (block_reward_coins * blocks_per_year / money_supply) * Decimal("100")
-        effective_apr = calculated_apr * NNS_STAKING_APR_FACTOR
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
 
-        if effective_apr < Decimal("0"):
-            effective_apr = Decimal("0")
-        elif effective_apr > Decimal("1000"):
-            effective_apr = Decimal("1000")
+        apr = Decimal(str(raw.get("apr_percent", CURRENT_NNS_STAKING_APR) or CURRENT_NNS_STAKING_APR))
+        if apr < Decimal("0"):
+            apr = Decimal("0")
+        elif apr > Decimal("1000"):
+            apr = Decimal("1000")
 
-        CURRENT_NNS_STAKING_APR = effective_apr
-        write_staking_apr_cache(CURRENT_NNS_STAKING_APR)
+        CURRENT_NNS_STAKING_APR = apr
+        return CURRENT_NNS_STAKING_APR
+    except FileNotFoundError:
         return CURRENT_NNS_STAKING_APR
     except Exception as e:
-        print(f"[nns_tipbot] dynamic APR refresh failed: {e}")
+        print(f"[nns_tipbot] APR cache refresh failed: {e}")
         return CURRENT_NNS_STAKING_APR
 
 
@@ -194,6 +209,7 @@ def init_db() -> None:
       veco_deposit_address TEXT,
       nns_internal_sat INTEGER NOT NULL DEFAULT 0,
       nns_deposit_address TEXT,
+      last_nns_claim_at INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       last_withdraw_at INTEGER NOT NULL DEFAULT 0
@@ -206,6 +222,10 @@ def init_db() -> None:
         pass
     try:
         con.execute("ALTER TABLE users ADD COLUMN nns_deposit_address TEXT;")
+    except Exception:
+        pass
+    try:
+        con.execute("ALTER TABLE users ADD COLUMN last_nns_claim_at INTEGER NOT NULL DEFAULT 0;")
     except Exception:
         pass
 
@@ -284,6 +304,37 @@ def init_db() -> None:
     );
     """)
 
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS nns_profiles (
+      discord_id INTEGER PRIMARY KEY,
+      xp_total INTEGER NOT NULL DEFAULT 0,
+      level INTEGER NOT NULL DEFAULT 1,
+      updated_at INTEGER NOT NULL
+    );
+    """)
+
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS nns_xp_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      discord_id INTEGER NOT NULL,
+      source TEXT NOT NULL,
+      xp_amount INTEGER NOT NULL,
+      note TEXT
+    );
+    """)
+
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS nns_xp_daily (
+      discord_id INTEGER NOT NULL,
+      day_key TEXT NOT NULL,
+      source TEXT NOT NULL,
+      claim_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(discord_id, day_key, source)
+    );
+    """)
+
+
     try:
         cols = con.execute("PRAGMA table_info(nns_stakes)").fetchall()
         reward_remainder_type = None
@@ -321,7 +372,7 @@ def init_db() -> None:
 
 def get_or_create_user(con: sqlite3.Connection, discord_id: int) -> Dict[str, Any]:
     row = con.execute(
-        "SELECT discord_id, nns_internal_sat, nns_deposit_address, created_at, updated_at "
+        "SELECT discord_id, nns_internal_sat, nns_deposit_address, last_nns_claim_at, created_at, updated_at "
         "FROM users WHERE discord_id=?",
         (int(discord_id),)
     ).fetchone()
@@ -331,22 +382,24 @@ def get_or_create_user(con: sqlite3.Connection, discord_id: int) -> Dict[str, An
             "discord_id": int(row[0]),
             "nns_internal_sat": int(row[1] or 0),
             "nns_deposit_address": row[2],
-            "created_at": int(row[3]),
-            "updated_at": int(row[4]),
+            "last_nns_claim_at": int(row[3] or 0),
+            "created_at": int(row[4]),
+            "updated_at": int(row[5]),
         }
 
     ts = now_ts()
     con.execute(
         "INSERT INTO users(discord_id, address, website_secret, balance, veco_internal_sat, veco_deposit_address, "
-        "nns_internal_sat, nns_deposit_address, created_at, updated_at, last_withdraw_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        (int(discord_id), None, None, 0, 0, None, 0, None, ts, ts, 0)
+        "nns_internal_sat, nns_deposit_address, last_nns_claim_at, created_at, updated_at, last_withdraw_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (int(discord_id), None, None, 0, 0, None, 0, None, 0, ts, ts, 0)
     )
 
     return {
         "discord_id": int(discord_id),
         "nns_internal_sat": 0,
         "nns_deposit_address": None,
+        "last_nns_claim_at": 0,
         "created_at": ts,
         "updated_at": ts,
     }
@@ -359,6 +412,220 @@ def has_pending_nns_withdraw(con: sqlite3.Connection, discord_id: int) -> bool:
     ).fetchone()
     return bool(row)
 
+
+def format_claim_cooldown(remaining_seconds: int) -> str:
+    remaining_seconds = max(0, int(remaining_seconds or 0))
+    minutes = remaining_seconds // 60
+    seconds = remaining_seconds % 60
+    return f"{minutes}m {seconds}s"
+
+
+def perform_nns_claim(discord_id: int) -> Dict[str, Any]:
+    if not NNS_CLAIM_ENABLED:
+        raise ValueError("Claiming is currently disabled.")
+
+    claim_amount_sat = int(NNS_CLAIM_AMOUNT_SAT)
+    cooldown_seconds = int(NNS_CLAIM_COOLDOWN_SECONDS)
+    if claim_amount_sat <= 0:
+        raise ValueError("Claim amount is misconfigured.")
+
+    con = db()
+    try:
+        con.execute("BEGIN IMMEDIATE;")
+        user = get_or_create_user(con, int(discord_id))
+
+        last_claim_at = int(user.get("last_nns_claim_at") or 0)
+        ts = now_ts()
+        next_allowed_at = last_claim_at + cooldown_seconds
+        if cooldown_seconds > 0 and ts < next_allowed_at:
+            con.execute("ROLLBACK;")
+            remaining = next_allowed_at - ts
+            raise ValueError(f"You can claim again in **{format_claim_cooldown(remaining)}**.")
+
+        profile = get_or_create_nns_profile(con, int(discord_id))
+        level = int(profile.get("level") or 1)
+        multiplier = get_nns_claim_multiplier_for_level(level)
+        final_claim_amount_sat = int((Decimal(claim_amount_sat) * multiplier).to_integral_value(rounding=ROUND_DOWN))
+
+        con.execute(
+            "UPDATE users SET nns_internal_sat = nns_internal_sat + ?, last_nns_claim_at=?, updated_at=? WHERE discord_id=?",
+            (final_claim_amount_sat, ts, ts, int(discord_id))
+        )
+        con.execute(
+            "INSERT INTO tx_log(ts, type, from_id, to_id, amount, note, status) VALUES(?,?,?,?,?,?,?)",
+            (ts, "claim_nns", None, int(discord_id), final_claim_amount_sat, f"claim cooldown={cooldown_seconds} level={level}", "ok")
+        )
+        xp_info = grant_nns_xp(con, int(discord_id), "claim_nns", NNS_XP_CLAIM, f"claim level={level}")
+        con.execute("COMMIT;")
+
+        return {
+            "amount_sat": final_claim_amount_sat,
+            "base_amount_sat": claim_amount_sat,
+            "claimed_at": ts,
+            "next_allowed_at": ts + cooldown_seconds,
+            "level": level,
+            "multiplier": str(multiplier),
+            "xp_total": int(xp_info["xp_total"]),
+            "leveled_up": bool(xp_info["leveled_up"]),
+            "new_level": int(xp_info["new_level"]),
+            "old_level": int(xp_info["old_level"]),
+        }
+    except Exception:
+        try:
+            con.execute("ROLLBACK;")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
+def get_or_create_nns_profile(con: sqlite3.Connection, discord_id: int) -> Dict[str, Any]:
+    row = con.execute(
+        "SELECT discord_id, xp_total, level, updated_at FROM nns_profiles WHERE discord_id=?",
+        (int(discord_id),)
+    ).fetchone()
+
+    if row:
+        return {
+            "discord_id": int(row[0]),
+            "xp_total": int(row[1] or 0),
+            "level": int(row[2] or 1),
+            "updated_at": int(row[3] or 0),
+        }
+
+    ts = now_ts()
+    con.execute(
+        "INSERT INTO nns_profiles(discord_id, xp_total, level, updated_at) VALUES(?,?,?,?)",
+        (int(discord_id), 0, 1, ts)
+    )
+    return {
+        "discord_id": int(discord_id),
+        "xp_total": 0,
+        "level": 1,
+        "updated_at": ts,
+    }
+
+
+def compute_nns_level_from_xp(xp_total: int) -> int:
+    xp_total = max(0, int(xp_total or 0))
+    level = 1
+    for idx, threshold in enumerate(NNS_LEVEL_XP_THRESHOLDS, start=1):
+        if xp_total >= int(threshold):
+            level = idx
+        else:
+            break
+    return min(10, max(1, level))
+
+
+def get_nns_claim_multiplier_for_level(level: int) -> Decimal:
+    level = min(10, max(1, int(level or 1)))
+    return NNS_LEVEL_CLAIM_MULTIPLIERS.get(level, Decimal("1.00"))
+
+
+def get_nns_next_level_xp(level: int) -> Optional[int]:
+    level = min(10, max(1, int(level or 1)))
+    if level >= len(NNS_LEVEL_XP_THRESHOLDS):
+        return None
+    return int(NNS_LEVEL_XP_THRESHOLDS[level])
+
+
+def grant_nns_xp(con: sqlite3.Connection, discord_id: int, source: str, xp_amount: int, note: Optional[str] = None) -> Dict[str, Any]:
+    xp_amount = int(xp_amount or 0)
+    profile = get_or_create_nns_profile(con, int(discord_id))
+    old_xp = int(profile.get("xp_total") or 0)
+    old_level = int(profile.get("level") or 1)
+    ts = now_ts()
+
+    if xp_amount <= 0:
+        return {
+            "xp_total": old_xp,
+            "level": old_level,
+            "leveled_up": False,
+            "old_level": old_level,
+            "new_level": old_level,
+            "xp_added": 0,
+        }
+
+    new_xp = old_xp + xp_amount
+    new_level = compute_nns_level_from_xp(new_xp)
+
+    con.execute(
+        "UPDATE nns_profiles SET xp_total=?, level=?, updated_at=? WHERE discord_id=?",
+        (int(new_xp), int(new_level), ts, int(discord_id))
+    )
+    con.execute(
+        "INSERT INTO nns_xp_log(ts, discord_id, source, xp_amount, note) VALUES(?,?,?,?,?)",
+        (ts, int(discord_id), str(source), int(xp_amount), (note or ""))
+    )
+
+    return {
+        "xp_total": int(new_xp),
+        "level": int(new_level),
+        "leveled_up": bool(new_level > old_level),
+        "old_level": int(old_level),
+        "new_level": int(new_level),
+        "xp_added": int(xp_amount),
+    }
+
+
+def get_day_key(ts: Optional[int] = None) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(int(ts or now_ts())))
+
+
+def grant_nns_xp_capped(
+    con: sqlite3.Connection,
+    discord_id: int,
+    source: str,
+    xp_amount: int,
+    daily_cap: int,
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    daily_cap = int(daily_cap or 0)
+    if daily_cap <= 0:
+        return grant_nns_xp(con, discord_id, source, xp_amount, note)
+
+    day_key = get_day_key()
+    row = con.execute(
+        "SELECT claim_count FROM nns_xp_daily WHERE discord_id=? AND day_key=? AND source=?",
+        (int(discord_id), day_key, str(source))
+    ).fetchone()
+    current_count = int(row[0] or 0) if row else 0
+
+    if current_count >= daily_cap:
+        profile = get_or_create_nns_profile(con, int(discord_id))
+        level = int(profile.get("level") or 1)
+        xp_total = int(profile.get("xp_total") or 0)
+        return {
+            "xp_total": xp_total,
+            "level": level,
+            "leveled_up": False,
+            "old_level": level,
+            "new_level": level,
+            "xp_added": 0,
+            "cap_reached": True,
+            "daily_count": current_count,
+            "daily_cap": daily_cap,
+        }
+
+    con.execute(
+        "INSERT INTO nns_xp_daily(discord_id, day_key, source, claim_count) VALUES(?,?,?,1) "
+        "ON CONFLICT(discord_id, day_key, source) DO UPDATE SET claim_count = claim_count + 1",
+        (int(discord_id), day_key, str(source))
+    )
+
+    info = grant_nns_xp(con, int(discord_id), source, xp_amount, note)
+    info["cap_reached"] = False
+    info["daily_count"] = current_count + 1
+    info["daily_cap"] = daily_cap
+    return info
+
+
+def get_tip_xp_amount_for_recipient(recipient_id: int) -> int:
+    base_xp = int(NNS_XP_TIP)
+    if int(NNS_XP_DONATION_BOT_USER_ID or 0) > 0 and int(recipient_id) == int(NNS_XP_DONATION_BOT_USER_ID):
+        return base_xp * 2
+    return base_xp
 
 # Role gate helper
 def get_role_gate_error(interaction: discord.Interaction) -> Optional[str]:
@@ -421,7 +688,7 @@ def get_role_gate_error(interaction: discord.Interaction) -> Optional[str]:
     print(
         f"[nns_tipbot] role gate deny user={int(interaction.user.id)} roles={role_ids} role_names={role_names} allowed_ids={sorted(NNS_TIPBOT_ALLOWED_ROLE_IDS)} allowed_names={sorted(NNS_TIPBOT_ALLOWED_ROLE_NAMES)}"
     )
-    return "You are not allowed to participate in this airdrop. Please get verified first. See the how-to channel for details."
+    return "You are not allowed to use this feature yet. Please get verified first. See the how-to channel for details."
 
 
 def is_admin(interaction: discord.Interaction, con: Optional[sqlite3.Connection] = None) -> bool:
@@ -822,7 +1089,6 @@ class NNSTipBot(discord.Client):
         self.loop.create_task(self.airdrop_expiry_loop())
         if NNS_STAKING_ENABLED:
             await refresh_dynamic_staking_apr()
-            write_staking_apr_cache(get_current_staking_apr())
             self.loop.create_task(self.staking_apr_refresh_loop())
             self.loop.create_task(self.staking_accrual_loop())
     async def staking_apr_refresh_loop(self):
@@ -965,10 +1231,39 @@ class AirdropClaimView(ui.View):
         finally:
             con.close()
 
-        await interaction.followup.send(
-            f"Claimed ✅ You received **{format_sat_to_nns(per_user_sat)} NNS** from airdrop #{self.airdrop_id}.",
-            ephemeral=True,
-        )
+        xp_info = {
+            "leveled_up": False,
+            "new_level": 1,
+            "cap_reached": False,
+            "daily_cap": NNS_XP_AIRDROP_CLAIM_DAILY_CAP,
+        }
+        con_xp = db()
+        try:
+            con_xp.execute("BEGIN IMMEDIATE;")
+            xp_info = grant_nns_xp_capped(
+                con_xp,
+                interaction.user.id,
+                "airdrop_claim_nns",
+                NNS_XP_AIRDROP_CLAIM,
+                NNS_XP_AIRDROP_CLAIM_DAILY_CAP,
+                f"airdrop #{self.airdrop_id}",
+            )
+            con_xp.execute("COMMIT;")
+        except Exception as xp_err:
+            try:
+                con_xp.execute("ROLLBACK;")
+            except Exception:
+                pass
+            print(f"[nns_tipbot] airdrop claim XP grant failed for user={int(interaction.user.id)} airdrop_id={self.airdrop_id}: {xp_err}")
+        finally:
+            con_xp.close()
+
+        claim_msg = f"Claimed ✅ You received **{format_sat_to_nns(per_user_sat)} NNS** from airdrop #{self.airdrop_id}."
+        if xp_info.get("leveled_up"):
+            claim_msg += f"\n🚀 Level up! You reached **Level {int(xp_info['new_level'])}**."
+        elif xp_info.get("cap_reached"):
+            claim_msg += f"\nℹ️ Airdrop-claim XP cap reached for today (**{int(xp_info.get('daily_cap') or 0)}x/day**)."
+        await interaction.followup.send(claim_msg, ephemeral=True)
         await refresh_airdrop_message(bot, self.airdrop_id)
 
         if PUBLIC_TIP_ANNOUNCEMENTS and interaction.channel is not None:
@@ -994,6 +1289,9 @@ async def help_cmd(interaction: discord.Interaction):
         "• `/tip @user <amount>` – Tip NNS to another user\n"
         "• `/multitip <amount> <users> [note]` – Tip the same NNS amount to multiple users\n"
         "• `/balances` – Show your internal NNS balance\n"
+        "• `/claim` – Claim free NNS every hour\n"
+        "• `/profile` – Show your level, XP, and claim multiplier\n"
+        "• `/leaderboard` – Show the top NNS levels\n"
         "• `/stake <amount>` – Move internal NNS into staking\n"
         "• `/unstake <amount|all>` – Unstake NNS and claim the proportional reward\n"
         "• `/stake_balance` – Show your staked balance and pending reward\n"
@@ -1005,12 +1303,14 @@ async def help_cmd(interaction: discord.Interaction):
         "Notes:\n"
         "• Deposits and withdrawals are processed by the existing NNS watcher.\n"
         "• This bot only writes to the shared TipBot database.\n"
+        f"• `/claim` grants **{format_sat_to_nns(NNS_CLAIM_AMOUNT_SAT)} NNS** every **{format_claim_cooldown(NNS_CLAIM_COOLDOWN_SECONDS)}**.\n"
         "• Airdrops credit internal NNS balances when users click the button.\n"
         f"• Staking APR: **{get_current_staking_apr():.4f}%** yearly (auto-adjusted).\n"
         f"• APR refresh interval: **{max(300, int(NNS_STAKING_APR_REFRESH_SECONDS))} seconds**.\n"
-        f"• APR cache file: **{NNS_STAKING_APR_CACHE_FILE}**.\n"
+        f"• APR cache file (read-only): **{NNS_STAKING_APR_CACHE_FILE}**.\n"
     )
     await interaction.response.send_message(text, ephemeral=True)
+
 
 
 @bot.tree.command(name="balances", description="Show your internal NNS balance.")
@@ -1029,6 +1329,104 @@ async def balances(interaction: discord.Interaction):
         )
     finally:
         con.close()
+
+
+@bot.tree.command(name="profile", description="Show your NNS level, XP, and claim multiplier.")
+async def profile(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=False)
+
+    con = db()
+    try:
+        profile_row = get_or_create_nns_profile(con, interaction.user.id)
+        xp_total = int(profile_row.get("xp_total") or 0)
+        level = int(profile_row.get("level") or 1)
+        next_level_xp = get_nns_next_level_xp(level)
+        multiplier = get_nns_claim_multiplier_for_level(level)
+
+        if next_level_xp is None:
+            next_line = "Next level: **max level reached**"
+        else:
+            remaining = max(0, int(next_level_xp) - xp_total)
+            next_line = f"Next level: **{remaining} XP remaining** (at {next_level_xp} XP)"
+
+        await interaction.followup.send(
+            f"Level: **{level}**\n"
+            f"XP: **{xp_total}**\n"
+            f"Claim multiplier: **{multiplier}x**\n"
+            f"{next_line}",
+            ephemeral=True,
+        )
+    finally:
+        con.close()
+
+
+@bot.tree.command(name="leaderboard", description="Show the top NNS levels on this bot.")
+async def leaderboard(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    con = db()
+    try:
+        rows = con.execute(
+            "SELECT discord_id, xp_total, level FROM nns_profiles ORDER BY level DESC, xp_total DESC, discord_id ASC LIMIT 10"
+        ).fetchall()
+    finally:
+        con.close()
+
+    if not rows:
+        await interaction.followup.send("No leaderboard data yet.", ephemeral=True)
+        return
+
+    lines: List[str] = []
+    for idx, row in enumerate(rows, start=1):
+        discord_id = int(row[0])
+        xp_total = int(row[1] or 0)
+        level = int(row[2] or 1)
+        lines.append(f"`#{idx}` <@{discord_id}> — Level **{level}**, XP **{xp_total}**")
+
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+@bot.tree.command(name="claim", description="Claim free NNS every hour.")
+async def claim(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    role_gate_error = get_role_gate_error(interaction)
+    if role_gate_error:
+        await interaction.followup.send(role_gate_error, ephemeral=True)
+        return
+
+    try:
+        res = perform_nns_claim(interaction.user.id)
+    except Exception as e:
+        await interaction.followup.send(str(e), ephemeral=True)
+        return
+
+    amount_sat = int(res["amount_sat"])
+    next_allowed_at = int(res["next_allowed_at"])
+    level = int(res.get("level") or 1)
+    multiplier = str(res.get("multiplier") or "1.00")
+    leveled_up = bool(res.get("leveled_up"))
+    new_level = int(res.get("new_level") or level)
+
+    msg = (
+        f"Claimed ✅ You received **{format_sat_to_nns(amount_sat)} NNS** "
+        f"at **Level {level}** (**{multiplier}x**). "
+        f"You can claim again <t:{next_allowed_at}:R>."
+    )
+    if leveled_up:
+        msg += f"\n🚀 Level up! You reached **Level {new_level}**."
+
+    await interaction.followup.send(msg, ephemeral=True)
+
+    if interaction.channel is not None:
+        try:
+            public_msg = (
+                f"🎉 {interaction.user.mention} claimed **{format_sat_to_nns(amount_sat)} NNS** "
+                f"with `/claim` at **Level {level}** (**{multiplier}x**)."
+            )
+            if leveled_up:
+                public_msg += f" 🚀 They reached **Level {new_level}**!"
+            await interaction.channel.send(public_msg)
+        except Exception:
+            pass
 
 
 @bot.tree.command(name="deposit", description="Show (or create) your personal NNS deposit address.")
@@ -1281,9 +1679,43 @@ async def withdraw_status(interaction: discord.Interaction, withdraw_id: int):
 async def tip(interaction: discord.Interaction, user: discord.User, amount: str, note: Optional[str] = None):
     await interaction.response.defer(ephemeral=True, thinking=True)
 
+    role_gate_error = get_role_gate_error(interaction)
+    if role_gate_error:
+        await interaction.followup.send(role_gate_error, ephemeral=True)
+        return
+
     try:
         amount_sat = parse_nns_to_sat(amount)
         perform_nns_tip(interaction.user.id, user.id, amount_sat, note)
+        xp_info = {
+            "leveled_up": False,
+            "new_level": 1,
+            "cap_reached": False,
+            "daily_count": 0,
+            "daily_cap": NNS_XP_TIP_DAILY_CAP,
+            "xp_skipped_reason": "below_min" if int(amount_sat) < int(NNS_XP_MIN_TIP_SAT) else "none",
+        }
+        if int(amount_sat) >= int(NNS_XP_MIN_TIP_SAT):
+            con_xp = db()
+            try:
+                con_xp.execute("BEGIN IMMEDIATE;")
+                xp_info = grant_nns_xp_capped(
+                    con_xp,
+                    interaction.user.id,
+                    "tip_nns",
+                    get_tip_xp_amount_for_recipient(int(user.id)),
+                    NNS_XP_TIP_DAILY_CAP,
+                    f"tip to {int(user.id)}",
+                )
+                con_xp.execute("COMMIT;")
+            except Exception as xp_err:
+                try:
+                    con_xp.execute("ROLLBACK;")
+                except Exception:
+                    pass
+                print(f"[nns_tipbot] tip XP grant failed for user={int(interaction.user.id)}: {xp_err}")
+            finally:
+                con_xp.close()
     except Exception as e:
         await interaction.followup.send(str(e), ephemeral=True)
         return
@@ -1297,10 +1729,16 @@ async def tip(interaction: discord.Interaction, user: discord.User, amount: str,
         except Exception:
             pass
 
-    await interaction.followup.send(
-        f"Tip sent ✅ You tipped {user.mention} **{format_sat_to_nns(amount_sat)}** NNS.",
-        ephemeral=True
-    )
+    tip_msg = f"Tip sent ✅ You tipped {user.mention} **{format_sat_to_nns(amount_sat)}** NNS."
+    if int(NNS_XP_DONATION_BOT_USER_ID or 0) > 0 and int(user.id) == int(NNS_XP_DONATION_BOT_USER_ID) and int(amount_sat) >= int(NNS_XP_MIN_TIP_SAT):
+        tip_msg += "\n🎁 Donation bonus: **double XP** awarded for tipping the donation bot."
+    if xp_info.get("leveled_up"):
+        tip_msg += f"\n🚀 Level up! You reached **Level {int(xp_info['new_level'])}**."
+    elif xp_info.get("cap_reached"):
+        tip_msg += f"\nℹ️ Tip XP cap reached for today (**{int(xp_info.get('daily_cap') or 0)}x/day**)."
+    elif xp_info.get("xp_skipped_reason") == "below_min":
+        tip_msg += f"\nℹ️ No XP awarded. Minimum for tip XP is **10 NNS**."
+    await interaction.followup.send(tip_msg, ephemeral=True)
 
 
 @bot.tree.command(name="multitip", description="Tip the same NNS amount to multiple users.")
@@ -1311,6 +1749,11 @@ async def tip(interaction: discord.Interaction, user: discord.User, amount: str,
 )
 async def multitip(interaction: discord.Interaction, amount: str, users: str, note: Optional[str] = None):
     await interaction.response.defer(ephemeral=True, thinking=True)
+
+    role_gate_error = get_role_gate_error(interaction)
+    if role_gate_error:
+        await interaction.followup.send(role_gate_error, ephemeral=True)
+        return
 
     try:
         amount_sat = parse_nns_to_sat(amount)
@@ -1395,12 +1838,43 @@ async def multitip(interaction: discord.Interaction, amount: str, users: str, no
 
         con.execute("COMMIT;")
 
-    except Exception:
+        xp_info = {
+            "leveled_up": False,
+            "new_level": 1,
+            "cap_reached": False,
+            "daily_count": 0,
+            "daily_cap": NNS_XP_MULTITIP_DAILY_CAP,
+            "xp_skipped_reason": "below_min" if int(amount_sat) < int(NNS_XP_MIN_TIP_SAT) else "none",
+        }
+        if int(amount_sat) >= int(NNS_XP_MIN_TIP_SAT):
+            con_xp = db()
+            try:
+                con_xp.execute("BEGIN IMMEDIATE;")
+                xp_info = grant_nns_xp_capped(
+                    con_xp,
+                    interaction.user.id,
+                    "multitip_nns",
+                    (int(NNS_XP_MULTITIP) * 2) if (int(NNS_XP_DONATION_BOT_USER_ID or 0) > 0 and int(NNS_XP_DONATION_BOT_USER_ID) in uniq_ids) else NNS_XP_MULTITIP,
+                    NNS_XP_MULTITIP_DAILY_CAP,
+                    f"multitip recipients={len(uniq_ids)}",
+                )
+                con_xp.execute("COMMIT;")
+            except Exception as xp_err:
+                try:
+                    con_xp.execute("ROLLBACK;")
+                except Exception:
+                    pass
+                print(f"[nns_tipbot] multitip XP grant failed for user={int(interaction.user.id)}: {xp_err}")
+            finally:
+                con_xp.close()
+
+    except Exception as e:
         try:
             con.execute("ROLLBACK;")
         except Exception:
             pass
-        raise
+        await interaction.followup.send(f"Multi-tip failed ❌ {e}", ephemeral=True)
+        return
     finally:
         con.close()
 
@@ -1416,13 +1890,21 @@ async def multitip(interaction: discord.Interaction, amount: str, users: str, no
         except Exception:
             pass
 
-    await interaction.followup.send(
+    multitip_msg = (
         f"Multi-tip sent ✅\n"
         f"Each: **{format_sat_to_nns(amount_sat)}** NNS\n"
         f"Recipients ({len(uniq_ids)}): {mention_list}\n"
-        f"Total: **{format_sat_to_nns(total_sat)}** NNS",
-        ephemeral=True,
+        f"Total: **{format_sat_to_nns(total_sat)}** NNS"
     )
+    if int(NNS_XP_DONATION_BOT_USER_ID or 0) > 0 and int(NNS_XP_DONATION_BOT_USER_ID) in uniq_ids and int(amount_sat) >= int(NNS_XP_MIN_TIP_SAT):
+        multitip_msg += "\n🎁 Donation bonus: **double XP** awarded because the donation bot was included."
+    if xp_info.get("leveled_up"):
+        multitip_msg += f"\n🚀 Level up! You reached **Level {int(xp_info['new_level'])}**."
+    elif xp_info.get("cap_reached"):
+        multitip_msg += f"\nℹ️ Multi-tip XP cap reached for today (**{int(xp_info.get('daily_cap') or 0)}x/day**)."
+    elif xp_info.get("xp_skipped_reason") == "below_min":
+        multitip_msg += f"\nℹ️ No XP awarded. Minimum for multi-tip XP is **10 NNS** per recipient."
+    await interaction.followup.send(multitip_msg, ephemeral=True)
 
 
 @bot.tree.command(name="start_airdrop", description="Start a button-based NNS airdrop from your internal balance.")
@@ -1585,10 +2067,39 @@ async def start_airdrop(interaction: discord.Interaction, per_user: str, limit: 
     finally:
         con2.close()
 
-    await interaction.followup.send(
-        f"Airdrop started ✅ Posted airdrop #{airdrop_id} with **{format_sat_to_nns(total_sat)} NNS** reserved.",
-        ephemeral=True,
-    )
+    xp_info = {
+        "leveled_up": False,
+        "new_level": 1,
+        "cap_reached": False,
+        "daily_cap": NNS_XP_AIRDROP_CREATE_DAILY_CAP,
+    }
+    con_xp = db()
+    try:
+        con_xp.execute("BEGIN IMMEDIATE;")
+        xp_info = grant_nns_xp_capped(
+            con_xp,
+            interaction.user.id,
+            "airdrop_create_nns",
+            NNS_XP_AIRDROP_CREATE,
+            NNS_XP_AIRDROP_CREATE_DAILY_CAP,
+            f"airdrop #{airdrop_id}",
+        )
+        con_xp.execute("COMMIT;")
+    except Exception as xp_err:
+        try:
+            con_xp.execute("ROLLBACK;")
+        except Exception:
+            pass
+        print(f"[nns_tipbot] airdrop create XP grant failed for user={int(interaction.user.id)} airdrop_id={airdrop_id}: {xp_err}")
+    finally:
+        con_xp.close()
+
+    airdrop_msg = f"Airdrop started ✅ Posted airdrop #{airdrop_id} with **{format_sat_to_nns(total_sat)} NNS** reserved."
+    if xp_info.get("leveled_up"):
+        airdrop_msg += f"\n🚀 Level up! You reached **Level {int(xp_info['new_level'])}**."
+    elif xp_info.get("cap_reached"):
+        airdrop_msg += f"\nℹ️ Airdrop-create XP cap reached for today (**{int(xp_info.get('daily_cap') or 0)}x/day**)."
+    await interaction.followup.send(airdrop_msg, ephemeral=True)
 
 
 @bot.tree.command(name="list_airdrops", description="List active NNS airdrops.")
@@ -1696,7 +2207,6 @@ async def end_airdrop(interaction: discord.Interaction, airdrop_id: int):
     )
 
 
-
 @bot.tree.command(name="stake_balance", description="Show your staked NNS and accrued staking reward.")
 async def stake_balance(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
@@ -1727,6 +2237,11 @@ async def stake_balance(interaction: discord.Interaction):
 @app_commands.describe(amount="Amount of NNS to stake (up to 8 decimals)")
 async def stake(interaction: discord.Interaction, amount: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
+
+    role_gate_error = get_role_gate_error(interaction)
+    if role_gate_error:
+        await interaction.followup.send(role_gate_error, ephemeral=True)
+        return
 
     if not NNS_STAKING_ENABLED:
         await interaction.followup.send("Staking is currently disabled.", ephemeral=True)
@@ -1778,10 +2293,43 @@ async def stake(interaction: discord.Interaction, amount: str):
     finally:
         con.close()
 
-    await interaction.followup.send(
-        f"Staked ✅ Moved **{format_sat_to_nns(amount_sat)} NNS** into staking.",
-        ephemeral=True,
-    )
+    xp_info = {
+        "leveled_up": False,
+        "new_level": 1,
+        "cap_reached": False,
+        "daily_cap": NNS_XP_STAKE_DAILY_CAP,
+        "xp_skipped_reason": "below_min" if int(amount_sat) < int(NNS_XP_MIN_STAKE_SAT) else "none",
+    }
+    if int(amount_sat) >= int(NNS_XP_MIN_STAKE_SAT):
+        con_xp = db()
+        try:
+            con_xp.execute("BEGIN IMMEDIATE;")
+            xp_info = grant_nns_xp_capped(
+                con_xp,
+                interaction.user.id,
+                "stake_nns",
+                NNS_XP_STAKE,
+                NNS_XP_STAKE_DAILY_CAP,
+                f"stake {amount_sat}",
+            )
+            con_xp.execute("COMMIT;")
+        except Exception as xp_err:
+            try:
+                con_xp.execute("ROLLBACK;")
+            except Exception:
+                pass
+            print(f"[nns_tipbot] stake XP grant failed for user={int(interaction.user.id)}: {xp_err}")
+        finally:
+            con_xp.close()
+
+    stake_msg = f"Staked ✅ Moved **{format_sat_to_nns(amount_sat)} NNS** into staking."
+    if xp_info.get("leveled_up"):
+        stake_msg += f"\n🚀 Level up! You reached **Level {int(xp_info['new_level'])}**."
+    elif xp_info.get("cap_reached"):
+        stake_msg += f"\nℹ️ Stake XP cap reached for today (**{int(xp_info.get('daily_cap') or 0)}x/day**)."
+    elif xp_info.get("xp_skipped_reason") == "below_min":
+        stake_msg += f"\nℹ️ No XP awarded. Minimum for stake XP is **10 NNS**."
+    await interaction.followup.send(stake_msg, ephemeral=True)
 
 
 @bot.tree.command(name="unstake", description="Unstake NNS and claim the proportional accrued reward.")
@@ -1876,6 +2424,11 @@ async def unstake(interaction: discord.Interaction, amount: str):
 async def claim_staking(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
 
+    role_gate_error = get_role_gate_error(interaction)
+    if role_gate_error:
+        await interaction.followup.send(role_gate_error, ephemeral=True)
+        return
+
     if not NNS_STAKING_ENABLED:
         await interaction.followup.send("Staking is currently disabled.", ephemeral=True)
         return
@@ -1922,10 +2475,43 @@ async def claim_staking(interaction: discord.Interaction):
     finally:
         con.close()
 
-    await interaction.followup.send(
-        f"Staking reward claimed ✅ Received **{format_sat_to_nns(current_reward_sat)} NNS** without unstaking.",
-        ephemeral=True,
-    )
+    xp_info = {
+        "leveled_up": False,
+        "new_level": 1,
+        "cap_reached": False,
+        "daily_cap": NNS_XP_CLAIM_STAKING_DAILY_CAP,
+        "xp_skipped_reason": "below_min" if int(current_reward_sat) < int(NNS_XP_MIN_STAKE_SAT) else "none",
+    }
+    if int(current_reward_sat) >= int(NNS_XP_MIN_STAKE_SAT):
+        con_xp = db()
+        try:
+            con_xp.execute("BEGIN IMMEDIATE;")
+            xp_info = grant_nns_xp_capped(
+                con_xp,
+                interaction.user.id,
+                "claim_staking_nns",
+                NNS_XP_CLAIM_STAKING,
+                NNS_XP_CLAIM_STAKING_DAILY_CAP,
+                f"claim staking {current_reward_sat}",
+            )
+            con_xp.execute("COMMIT;")
+        except Exception as xp_err:
+            try:
+                con_xp.execute("ROLLBACK;")
+            except Exception:
+                pass
+            print(f"[nns_tipbot] claim_staking XP grant failed for user={int(interaction.user.id)}: {xp_err}")
+        finally:
+            con_xp.close()
+
+    claim_staking_msg = f"Staking reward claimed ✅ Received **{format_sat_to_nns(current_reward_sat)} NNS** without unstaking."
+    if xp_info.get("leveled_up"):
+        claim_staking_msg += f"\n🚀 Level up! You reached **Level {int(xp_info['new_level'])}**."
+    elif xp_info.get("cap_reached"):
+        claim_staking_msg += f"\nℹ️ Claim-staking XP cap reached for today (**{int(xp_info.get('daily_cap') or 0)}x/day**)."
+    elif xp_info.get("xp_skipped_reason") == "below_min":
+        claim_staking_msg += f"\nℹ️ No XP awarded. Minimum for claim-staking XP is **10 NNS**."
+    await interaction.followup.send(claim_staking_msg, ephemeral=True)
 
 
 def main():

@@ -37,7 +37,12 @@ WITHDRAW_SLEEP_BETWEEN = float(os.environ.get("NNS_WITHDRAW_SLEEP", "0.2"))
 
 EXPLORER_SENDRAWTX_URL = os.environ.get("EXPLORER_SENDRAWTX_URL", "").strip()
 EXPLORER_TX_API_KEY = os.environ.get("EXPLORER_TX_API_KEY", "").strip()
+
 EXPLORER_REBROADCAST_TIMEOUT = int(os.environ.get("EXPLORER_REBROADCAST_TIMEOUT", "20"))
+NNS_RPC_TIMEOUT = int(os.environ.get("NNS_RPC_TIMEOUT", "30"))
+NNS_RPC_RETRIES = int(os.environ.get("NNS_RPC_RETRIES", "1"))
+NNS_RPC_RETRY_DELAY = float(os.environ.get("NNS_RPC_RETRY_DELAY", "1.5"))
+NNS_CONFIRMATION_REFRESH_SLEEP = float(os.environ.get("NNS_CONFIRMATION_REFRESH_SLEEP", "0.05"))
 
 
 # ---------------------------
@@ -120,6 +125,27 @@ def set_lastblockhash(con: sqlite3.Connection, bh: Optional[str]) -> None:
     )
 
 
+
+_RPC_SESSION: Optional[aiohttp.ClientSession] = None
+
+
+async def get_rpc_session() -> aiohttp.ClientSession:
+    global _RPC_SESSION
+    if _RPC_SESSION is None or _RPC_SESSION.closed:
+        auth = aiohttp.BasicAuth(NNS_RPC_USER, NNS_RPC_PASSWORD)
+        timeout = aiohttp.ClientTimeout(total=NNS_RPC_TIMEOUT)
+        connector = aiohttp.TCPConnector(limit=8, limit_per_host=8, keepalive_timeout=30)
+        _RPC_SESSION = aiohttp.ClientSession(auth=auth, timeout=timeout, connector=connector)
+    return _RPC_SESSION
+
+
+async def close_rpc_session() -> None:
+    global _RPC_SESSION
+    if _RPC_SESSION is not None and not _RPC_SESSION.closed:
+        await _RPC_SESSION.close()
+    _RPC_SESSION = None
+
+
 async def nns_rpc_call(method: str, params: Optional[List[Any]] = None) -> Any:
     if not NNS_RPC_URL or not NNS_RPC_USER or not NNS_RPC_PASSWORD:
         raise RuntimeError("996-Coin RPC not configured (NNS_RPC_URL/USER/PASSWORD)")
@@ -131,16 +157,35 @@ async def nns_rpc_call(method: str, params: Optional[List[Any]] = None) -> Any:
         "params": params or [],
     }
 
-    auth = aiohttp.BasicAuth(NNS_RPC_USER, NNS_RPC_PASSWORD)
-    async with aiohttp.ClientSession(auth=auth) as session:
-        async with session.post(NNS_RPC_URL, json=payload, timeout=30) as r:
-            txt = await r.text()
-            if r.status != 200:
-                raise RuntimeError(f"996-Coin RPC HTTP {r.status}: {txt}")
-            data = json.loads(txt)
-            if data.get("error"):
-                raise RuntimeError(f"996-Coin RPC error: {data['error']}")
-            return data.get("result")
+    attempts = max(1, int(NNS_RPC_RETRIES) + 1)
+    last_err: Optional[Exception] = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            session = await get_rpc_session()
+            async with session.post(NNS_RPC_URL, json=payload) as r:
+                txt = await r.text()
+                if r.status != 200:
+                    raise RuntimeError(f"996-Coin RPC HTTP {r.status}: {txt}")
+                data = json.loads(txt)
+                if data.get("error"):
+                    raise RuntimeError(f"996-Coin RPC error: {data['error']}")
+                return data.get("result")
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            transient = (
+                isinstance(e, aiohttp.ClientError)
+                or isinstance(e, asyncio.TimeoutError)
+                or "work queue depth exceeded" in msg.lower()
+                or "cannot connect to host" in msg.lower()
+                or "server disconnected" in msg.lower()
+            )
+            if attempt >= attempts or not transient:
+                break
+            await asyncio.sleep(max(0.0, float(NNS_RPC_RETRY_DELAY)))
+
+    raise RuntimeError(str(last_err) if last_err else "unknown RPC error")
 
 
 # ---------------------------
@@ -261,6 +306,8 @@ async def refresh_uncredited_confirmations(con: sqlite3.Connection) -> int:
         try:
             gt = await nns_rpc_call("gettransaction", [txid])
         except Exception:
+            if NNS_CONFIRMATION_REFRESH_SLEEP > 0:
+                await asyncio.sleep(NNS_CONFIRMATION_REFRESH_SLEEP)
             continue
 
         confs = int(gt.get("confirmations") or 0) if isinstance(gt, dict) else 0
@@ -273,6 +320,9 @@ async def refresh_uncredited_confirmations(con: sqlite3.Connection) -> int:
         )
         if cur.rowcount:
             updated += int(cur.rowcount)
+
+        if NNS_CONFIRMATION_REFRESH_SLEEP > 0:
+            await asyncio.sleep(NNS_CONFIRMATION_REFRESH_SLEEP)
 
     return updated
 
@@ -485,22 +535,25 @@ async def main_loop() -> None:
 
     last_log_ts = 0
 
-    while True:
-        try:
-            seen, credited = await process_deposits()
-            sent, failed = await process_withdrawals()
+    try:
+        while True:
+            try:
+                seen, credited = await process_deposits()
+                sent, failed = await process_withdrawals()
 
-            if should_log_status(seen, credited, sent, failed, last_log_ts):
-                print(
-                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
-                    f"deposits: seen={seen} credited={credited} | withdrawals: sent={sent} failed={failed}",
-                    flush=True,
-                )
-                last_log_ts = now_ts()
-        except Exception as e:
-            print(f"[ERROR] {e}", flush=True)
+                if should_log_status(seen, credited, sent, failed, last_log_ts):
+                    print(
+                        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                        f"deposits: seen={seen} credited={credited} | withdrawals: sent={sent} failed={failed}",
+                        flush=True,
+                    )
+                    last_log_ts = now_ts()
+            except Exception as e:
+                print(f"[ERROR] {e}", flush=True)
 
-        await asyncio.sleep(POLL_SECONDS)
+            await asyncio.sleep(POLL_SECONDS)
+    finally:
+        await close_rpc_session()
 
 
 if __name__ == "__main__":

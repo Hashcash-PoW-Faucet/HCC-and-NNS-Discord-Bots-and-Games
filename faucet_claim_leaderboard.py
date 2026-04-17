@@ -29,6 +29,12 @@ MAX_NAME_LEN = int(os.getenv("LEADERBOARD_MAX_NAME_LEN", "22"))
 # Store last webhook message id so we can edit instead of reposting
 MESSAGE_ID_FILE = os.getenv("LEADERBOARD_MESSAGE_ID_FILE", "faucet_leaderboard_message_id.txt").strip()
 
+BLACKLIST_IDS = {
+    int(x.strip())
+    for x in os.getenv("LEADERBOARD_BLACKLIST_IDS", "").split(",")
+    if x.strip().isdigit()
+}
+
 # Optional: resolve usernames via Discord API (fills/updates cache)
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()  # reuse your bot token if you want
 GUILD_ID = os.getenv("GUILD_ID", "").strip()  # optional: enables guild nickname lookup
@@ -277,14 +283,18 @@ def fetch_faucet_leaderboard(con: sqlite3.Connection, top_n: int) -> List[Tuple[
     LIMIT ?
     """
     out: List[Tuple[int, int, int]] = []
-    for row in con.execute(q, (int(top_n),)).fetchall():
+    for row in con.execute(q, (int(top_n) + max(0, len(BLACKLIST_IDS)),)).fetchall():
         try:
             did = int(row[0])
             total = int(row[1] or 0)
             cnt = int(row[2] or 0)
         except Exception:
             continue
+        if did in BLACKLIST_IDS:
+            continue
         out.append((did, total, cnt))
+        if len(out) >= int(top_n):
+            break
     return out
 
 

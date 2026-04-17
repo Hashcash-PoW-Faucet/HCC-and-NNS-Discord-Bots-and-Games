@@ -24,7 +24,7 @@ VECO_RPC_PASSWORD = os.environ.get("VECO_RPC_PASSWORD", "").strip()
 VECO_SATS = 100_000_000
 VECO_DEPOSIT_CONFS = int(os.environ.get("VECO_DEPOSIT_CONFS", "6"))
 
-POLL_SECONDS = int(os.environ.get("VECO_POLL_SECONDS", "15"))
+POLL_SECONDS = int(os.environ.get("VECO_POLL_SECONDS", "20"))
 
 # Logging: print a heartbeat line at most every N seconds (also logs immediately if something happened)
 LOG_HEARTBEAT_SECONDS = int(os.environ.get("VECO_LOG_HEARTBEAT_SECONDS", "600"))
@@ -32,10 +32,15 @@ WITHDRAW_BATCH = int(os.environ.get("VECO_WITHDRAW_BATCH", "10"))
 
 
 # How many uncredited deposits to refresh per loop (for confirmations)
-DEPOSIT_REFRESH_BATCH = int(os.environ.get("VECO_DEPOSIT_REFRESH_BATCH", "200"))
+DEPOSIT_REFRESH_BATCH = int(os.environ.get("VECO_DEPOSIT_REFRESH_BATCH", "50"))
 
 # Safety: don’t spam sends too fast
 WITHDRAW_SLEEP_BETWEEN = float(os.environ.get("VECO_WITHDRAW_SLEEP", "0.2"))
+
+VECO_RPC_TIMEOUT = int(os.environ.get("VECO_RPC_TIMEOUT", "30"))
+VECO_RPC_RETRIES = int(os.environ.get("VECO_RPC_RETRIES", "1"))
+VECO_RPC_RETRY_DELAY = float(os.environ.get("VECO_RPC_RETRY_DELAY", "1.5"))
+VECO_CONFIRMATION_REFRESH_SLEEP = float(os.environ.get("VECO_CONFIRMATION_REFRESH_SLEEP", "0.05"))
 
 # ---------------------------
 # Helpers
@@ -122,6 +127,26 @@ def set_lastblockhash(con: sqlite3.Connection, bh: Optional[str]) -> None:
     )
 
 
+_RPC_SESSION: Optional[aiohttp.ClientSession] = None
+
+
+async def get_rpc_session() -> aiohttp.ClientSession:
+    global _RPC_SESSION
+    if _RPC_SESSION is None or _RPC_SESSION.closed:
+        auth = aiohttp.BasicAuth(VECO_RPC_USER, VECO_RPC_PASSWORD)
+        timeout = aiohttp.ClientTimeout(total=VECO_RPC_TIMEOUT)
+        connector = aiohttp.TCPConnector(limit=8, limit_per_host=8, keepalive_timeout=30)
+        _RPC_SESSION = aiohttp.ClientSession(auth=auth, timeout=timeout, connector=connector)
+    return _RPC_SESSION
+
+
+async def close_rpc_session() -> None:
+    global _RPC_SESSION
+    if _RPC_SESSION is not None and not _RPC_SESSION.closed:
+        await _RPC_SESSION.close()
+    _RPC_SESSION = None
+
+
 async def veco_rpc_call(method: str, params: Optional[List[Any]] = None) -> Any:
     if not VECO_RPC_URL or not VECO_RPC_USER or not VECO_RPC_PASSWORD:
         raise RuntimeError("VECO RPC not configured (VECO_RPC_URL/USER/PASSWORD)")
@@ -133,16 +158,35 @@ async def veco_rpc_call(method: str, params: Optional[List[Any]] = None) -> Any:
         "params": params or [],
     }
 
-    auth = aiohttp.BasicAuth(VECO_RPC_USER, VECO_RPC_PASSWORD)
-    async with aiohttp.ClientSession(auth=auth) as session:
-        async with session.post(VECO_RPC_URL, json=payload, timeout=30) as r:
-            txt = await r.text()
-            if r.status != 200:
-                raise RuntimeError(f"VECO RPC HTTP {r.status}: {txt}")
-            data = json.loads(txt)
-            if data.get("error"):
-                raise RuntimeError(f"VECO RPC error: {data['error']}")
-            return data.get("result")
+    attempts = max(1, int(VECO_RPC_RETRIES) + 1)
+    last_err: Optional[Exception] = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            session = await get_rpc_session()
+            async with session.post(VECO_RPC_URL, json=payload) as r:
+                txt = await r.text()
+                if r.status != 200:
+                    raise RuntimeError(f"VECO RPC HTTP {r.status}: {txt}")
+                data = json.loads(txt)
+                if data.get("error"):
+                    raise RuntimeError(f"VECO RPC error: {data['error']}")
+                return data.get("result")
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            transient = (
+                isinstance(e, aiohttp.ClientError)
+                or isinstance(e, asyncio.TimeoutError)
+                or "work queue depth exceeded" in msg.lower()
+                or "cannot connect to host" in msg.lower()
+                or "server disconnected" in msg.lower()
+            )
+            if attempt >= attempts or not transient:
+                break
+            await asyncio.sleep(max(0.0, float(VECO_RPC_RETRY_DELAY)))
+
+    raise RuntimeError(str(last_err) if last_err else "unknown RPC error")
 
 
 def load_address_map(con: sqlite3.Connection) -> Dict[str, int]:
@@ -233,6 +277,8 @@ async def refresh_uncredited_confirmations(con: sqlite3.Connection) -> int:
         try:
             gt = await veco_rpc_call("gettransaction", [txid])
         except Exception:
+            if VECO_CONFIRMATION_REFRESH_SLEEP > 0:
+                await asyncio.sleep(VECO_CONFIRMATION_REFRESH_SLEEP)
             continue
 
         confs = int(gt.get("confirmations") or 0) if isinstance(gt, dict) else 0
@@ -246,6 +292,9 @@ async def refresh_uncredited_confirmations(con: sqlite3.Connection) -> int:
         )
         if cur.rowcount:
             updated += int(cur.rowcount)
+
+        if VECO_CONFIRMATION_REFRESH_SLEEP > 0:
+            await asyncio.sleep(VECO_CONFIRMATION_REFRESH_SLEEP)
 
     return updated
 
@@ -456,22 +505,25 @@ async def main_loop() -> None:
 
     last_log_ts = 0
 
-    while True:
-        try:
-            seen, credited = await process_deposits()
-            sent, failed = await process_withdrawals()
+    try:
+        while True:
+            try:
+                seen, credited = await process_deposits()
+                sent, failed = await process_withdrawals()
 
-            if should_log_status(seen, credited, sent, failed, last_log_ts):
-                print(
-                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
-                    f"deposits: seen={seen} credited={credited} | withdrawals: sent={sent} failed={failed}",
-                    flush=True,
-                )
-                last_log_ts = now_ts()
-        except Exception as e:
-            print(f"[ERROR] {e}", flush=True)
+                if should_log_status(seen, credited, sent, failed, last_log_ts):
+                    print(
+                        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                        f"deposits: seen={seen} credited={credited} | withdrawals: sent={sent} failed={failed}",
+                        flush=True,
+                    )
+                    last_log_ts = now_ts()
+            except Exception as e:
+                print(f"[ERROR] {e}", flush=True)
 
-        await asyncio.sleep(POLL_SECONDS)
+            await asyncio.sleep(POLL_SECONDS)
+    finally:
+        await close_rpc_session()
 
 
 if __name__ == "__main__":
