@@ -12,6 +12,7 @@ from discord import app_commands
 from discord import ui
 import aiohttp
 import asyncio
+import random
 
 load_dotenv()
 
@@ -58,11 +59,12 @@ NNS_WITHDRAW_FEE_ADDRESS = os.environ.get("NNS_WITHDRAW_FEE_ADDRESS", "").strip(
 NNS_SATS = 100_000_000
 
 NNS_CLAIM_ENABLED = os.environ.get("NNS_CLAIM_ENABLED", "1").strip() == "1"
-NNS_CLAIM_AMOUNT_SAT = int(Decimal(os.environ.get("NNS_CLAIM_AMOUNT", "0.96600000")).quantize(
+NNS_CLAIM_AMOUNT_SAT = int(Decimal(os.environ.get("NNS_CLAIM_AMOUNT", "0.99600000")).quantize(
     Decimal("0.00000001"), rounding=ROUND_DOWN
 ) * Decimal("100000000"))
 NNS_CLAIM_COOLDOWN_SECONDS = int(os.environ.get("NNS_CLAIM_COOLDOWN_SECONDS", str(60 * 60)))
-NNS_LEVEL_XP_THRESHOLDS = [0, 50, 125, 225, 350, 500, 700, 950, 1250, 1600]
+NNS_CLAIM_ALLOWED_CHANNEL_ID = int(os.environ.get("NNS_CLAIM_ALLOWED_CHANNEL_ID", "1494570081043218452").strip() or "0")
+NNS_LEVEL_XP_THRESHOLDS = [0, 50, 125, 225, 350, 500, 700, 950, 1250, 1600, 2000, 2500, 3100, 3800, 4600, 5500]
 NNS_LEVEL_CLAIM_MULTIPLIERS = {
     1: Decimal("1.00"),
     2: Decimal("1.10"),
@@ -73,7 +75,13 @@ NNS_LEVEL_CLAIM_MULTIPLIERS = {
     7: Decimal("1.60"),
     8: Decimal("1.70"),
     9: Decimal("1.80"),
-    10: Decimal("2.00"),
+    10: Decimal("1.90"),
+    11: Decimal("2.00"),
+    12: Decimal("2.10"),
+    13: Decimal("2.20"),
+    14: Decimal("2.30"),
+    15: Decimal("2.40"),
+    16: Decimal("2.50"),
 }
 
 NNS_XP_CLAIM = 5
@@ -94,7 +102,28 @@ NNS_XP_STAKE_DAILY_CAP = 2
 
 NNS_XP_CLAIM_STAKING_DAILY_CAP = 3
 
+
+
 NNS_XP_DONATION_BOT_USER_ID = int(os.environ.get("NNS_XP_DONATION_BOT_USER_ID", "0").strip() or "0")
+
+# Treasure Chest config
+NNS_CHEST_ENABLED = os.environ.get("NNS_CHEST_ENABLED", "1").strip() == "1"
+NNS_CHEST_COST_SAT = int(Decimal(os.environ.get("NNS_CHEST_COST", "3.00000000")).quantize(
+    Decimal("0.00000001"), rounding=ROUND_DOWN
+) * Decimal("100000000"))
+NNS_CHEST_COOLDOWN_SECONDS = int(os.environ.get("NNS_CHEST_COOLDOWN_SECONDS", str(30 * 60)))
+NNS_CHEST_ALLOWED_CHANNEL_ID = int(os.environ.get("NNS_CHEST_ALLOWED_CHANNEL_ID", "1495253280337432756").strip() or "0")
+NNS_XP_CHEST_MIN = int(os.environ.get("NNS_XP_CHEST_MIN", "2"))
+NNS_XP_CHEST_MAX = int(os.environ.get("NNS_XP_CHEST_MAX", "5"))
+NNS_XP_CHEST_GOLDEN = int(os.environ.get("NNS_XP_CHEST_GOLDEN", "20"))
+NNS_CHEST_GOLDEN_CHANCE_PERCENT = Decimal(os.environ.get("NNS_CHEST_GOLDEN_CHANCE_PERCENT", "5").strip() or "5")
+
+NNS_TIP_BLOCKED_RECIPIENT_IDS = {
+    int(x.strip())
+    for x in os.environ.get("NNS_TIP_BLOCKED_RECIPIENT_IDS", "1487887518442586173").split(",")
+    if x.strip().isdigit()
+}
+print(f"[nns_tipbot] blocked tip recipient ids: {sorted(NNS_TIP_BLOCKED_RECIPIENT_IDS)}")
 
 
 # Airdrop config
@@ -334,6 +363,15 @@ def init_db() -> None:
     );
     """)
 
+    # Treasure Chest state table
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS nns_chest_state (
+      discord_id INTEGER PRIMARY KEY,
+      last_played_at INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    """)
 
     try:
         cols = con.execute("PRAGMA table_info(nns_stakes)").fetchall()
@@ -515,7 +553,7 @@ def compute_nns_level_from_xp(xp_total: int) -> int:
             level = idx
         else:
             break
-    return min(10, max(1, level))
+    return min(16, max(1, level))
 
 
 def get_nns_claim_multiplier_for_level(level: int) -> Decimal:
@@ -573,6 +611,146 @@ def get_day_key(ts: Optional[int] = None) -> str:
     return time.strftime("%Y-%m-%d", time.gmtime(int(ts or now_ts())))
 
 
+# --- Treasure Chest helpers ---
+def get_or_create_nns_chest_state(con: sqlite3.Connection, discord_id: int) -> Dict[str, Any]:
+    row = con.execute(
+        "SELECT discord_id, last_played_at, created_at, updated_at FROM nns_chest_state WHERE discord_id=?",
+        (int(discord_id),)
+    ).fetchone()
+
+    if row:
+        return {
+            "discord_id": int(row[0]),
+            "last_played_at": int(row[1] or 0),
+            "created_at": int(row[2] or 0),
+            "updated_at": int(row[3] or 0),
+        }
+
+    ts = now_ts()
+    con.execute(
+        "INSERT INTO nns_chest_state(discord_id, last_played_at, created_at, updated_at) VALUES(?,?,?,?)",
+        (int(discord_id), 0, ts, ts)
+    )
+    return {
+        "discord_id": int(discord_id),
+        "last_played_at": 0,
+        "created_at": ts,
+        "updated_at": ts,
+    }
+
+
+def get_chest_cooldown_remaining(con: sqlite3.Connection, discord_id: int) -> int:
+    state = get_or_create_nns_chest_state(con, int(discord_id))
+    last_played_at = int(state.get("last_played_at") or 0)
+    next_allowed_at = last_played_at + int(NNS_CHEST_COOLDOWN_SECONDS)
+    return max(0, next_allowed_at - now_ts())
+
+
+def get_chest_embed(user: discord.abc.User, status_text: str, reveal: Optional[str] = None, golden: bool = False) -> discord.Embed:
+    title = "🧰 Treasure Chest"
+    if golden:
+        title = "✨ Golden Chest"
+
+    desc = (
+        f"Player: {user.mention}\n"
+        f"Cost: **{format_sat_to_nns(NNS_CHEST_COST_SAT)} NNS** (burned)\n"
+        f"Pick one chest below."
+    )
+    if status_text:
+        desc += f"\n\n{status_text}"
+    if reveal:
+        desc += f"\n\n{reveal}"
+
+    embed = discord.Embed(title=title, description=desc)
+    if golden:
+        embed.color = discord.Color.gold()
+    else:
+        embed.color = discord.Color.orange()
+    embed.set_footer(text="One play every 30 minutes")
+    return embed
+
+
+def perform_nns_chest_play(discord_id: int, chosen_index: int) -> Dict[str, Any]:
+    if not NNS_CHEST_ENABLED:
+        raise ValueError("Treasure Chest is currently disabled.")
+    if int(NNS_CHEST_COST_SAT) <= 0:
+        raise ValueError("Treasure Chest cost is misconfigured.")
+    if int(chosen_index) not in (0, 1, 2):
+        raise ValueError("Invalid chest selection.")
+
+    con = db()
+    try:
+        con.execute("BEGIN IMMEDIATE;")
+
+        user = get_or_create_user(con, int(discord_id))
+        state = get_or_create_nns_chest_state(con, int(discord_id))
+        balance_sat = int(user.get("nns_internal_sat") or 0)
+        if balance_sat < int(NNS_CHEST_COST_SAT):
+            con.execute("ROLLBACK;")
+            raise ValueError(
+                f"Insufficient NNS balance. You need **{format_sat_to_nns(NNS_CHEST_COST_SAT)} NNS** but only have **{format_sat_to_nns(balance_sat)} NNS**."
+            )
+
+        last_played_at = int(state.get("last_played_at") or 0)
+        next_allowed_at = last_played_at + int(NNS_CHEST_COOLDOWN_SECONDS)
+        ts = now_ts()
+        if ts < next_allowed_at:
+            con.execute("ROLLBACK;")
+            remaining = next_allowed_at - ts
+            raise ValueError(f"You can play Treasure Chest again in **{format_claim_cooldown(remaining)}**.")
+
+        winning_index = random.randint(0, 2)
+        golden_roll = Decimal(str(random.uniform(0, 100)))
+        is_golden = golden_roll < NNS_CHEST_GOLDEN_CHANCE_PERCENT
+        xp_reward = int(NNS_XP_CHEST_GOLDEN if is_golden else random.randint(int(NNS_XP_CHEST_MIN), int(NNS_XP_CHEST_MAX)))
+        won = int(chosen_index) == int(winning_index)
+
+        con.execute(
+            "UPDATE users SET nns_internal_sat = nns_internal_sat - ?, updated_at=? WHERE discord_id=?",
+            (int(NNS_CHEST_COST_SAT), ts, int(discord_id))
+        )
+        con.execute(
+            "UPDATE nns_chest_state SET last_played_at=?, updated_at=? WHERE discord_id=?",
+            (ts, ts, int(discord_id))
+        )
+        con.execute(
+            "INSERT INTO tx_log(ts, type, from_id, to_id, amount, note, status) VALUES(?,?,?,?,?,?,?)",
+            (ts, "chest_burn_nns", int(discord_id), None, int(NNS_CHEST_COST_SAT), f"treasure chest pick={int(chosen_index)+1}", "ok")
+        )
+
+        xp_info = {
+            "xp_total": 0,
+            "level": 1,
+            "leveled_up": False,
+            "old_level": 1,
+            "new_level": 1,
+            "xp_added": 0,
+        }
+        if won and xp_reward > 0:
+            xp_info = grant_nns_xp(con, int(discord_id), "chest_win_nns", int(xp_reward), f"treasure chest golden={int(is_golden)}")
+
+        con.execute("COMMIT;")
+
+        return {
+            "won": bool(won),
+            "golden": bool(is_golden),
+            "xp_reward": int(xp_reward if won else 0),
+            "winning_index": int(winning_index),
+            "chosen_index": int(chosen_index),
+            "cost_sat": int(NNS_CHEST_COST_SAT),
+            "next_allowed_at": ts + int(NNS_CHEST_COOLDOWN_SECONDS),
+            "xp_info": xp_info,
+        }
+    except Exception:
+        try:
+            con.execute("ROLLBACK;")
+        except Exception:
+            pass
+        raise
+    finally:
+        con.close()
+
+
 def grant_nns_xp_capped(
     con: sqlite3.Connection,
     discord_id: int,
@@ -621,11 +799,16 @@ def grant_nns_xp_capped(
     return info
 
 
+
 def get_tip_xp_amount_for_recipient(recipient_id: int) -> int:
     base_xp = int(NNS_XP_TIP)
     if int(NNS_XP_DONATION_BOT_USER_ID or 0) > 0 and int(recipient_id) == int(NNS_XP_DONATION_BOT_USER_ID):
         return base_xp * 2
     return base_xp
+
+
+def is_tip_blocked_recipient(discord_id: int) -> bool:
+    return int(discord_id) in NNS_TIP_BLOCKED_RECIPIENT_IDS
 
 # Role gate helper
 def get_role_gate_error(interaction: discord.Interaction) -> Optional[str]:
@@ -1275,6 +1458,95 @@ class AirdropClaimView(ui.View):
                 pass
 
 
+class ChestGameView(ui.View):
+    def __init__(self, owner_id: int, *, disabled: bool = False):
+        super().__init__(timeout=180)
+        self.owner_id = int(owner_id)
+        self.resolved = False
+
+        labels = ["🧰 Chest 1", "🧰 Chest 2", "🧰 Chest 3"]
+        for idx, label in enumerate(labels):
+            button = ui.Button(
+                label=label,
+                style=discord.ButtonStyle.blurple,
+                custom_id=f"nns_chest:{self.owner_id}:{idx}",
+                disabled=disabled,
+                row=0,
+            )
+            button.callback = self.make_callback(idx)
+            self.add_item(button)
+
+    def disable_all(self) -> None:
+        for item in self.children:
+            if isinstance(item, ui.Button):
+                item.disabled = True
+
+    def make_callback(self, chosen_index: int):
+        async def callback(interaction: discord.Interaction):
+            if int(interaction.user.id) != int(self.owner_id):
+                await interaction.response.send_message("Only the player who started this game can open a chest.", ephemeral=True)
+                return
+
+            if self.resolved:
+                await interaction.response.send_message("This Treasure Chest game is already finished.", ephemeral=True)
+                return
+
+            try:
+                result = perform_nns_chest_play(interaction.user.id, int(chosen_index))
+            except Exception as e:
+                await interaction.response.send_message(str(e), ephemeral=True)
+                return
+
+            self.resolved = True
+            self.disable_all()
+
+            won = bool(result.get("won"))
+            golden = bool(result.get("golden"))
+            xp_reward = int(result.get("xp_reward") or 0)
+            winning_index = int(result.get("winning_index") or 0)
+            next_allowed_at = int(result.get("next_allowed_at") or 0)
+            xp_info = result.get("xp_info") or {}
+
+            labels = ["Chest 1", "Chest 2", "Chest 3"]
+            reveal_parts = []
+            for idx, name in enumerate(labels):
+                if idx == winning_index:
+                    if golden:
+                        reveal_parts.append(f"**{name}: ✨ GOLDEN XP**")
+                    else:
+                        reveal_parts.append(f"**{name}: 🎉 XP**")
+                else:
+                    reveal_parts.append(f"{name}: empty")
+            reveal_text = "\n".join(reveal_parts)
+
+            if won:
+                result_text = f"✅ {interaction.user.mention} opened the winning chest and gained **{xp_reward} XP**!"
+                if golden:
+                    result_text += " **Golden chest!**"
+            else:
+                result_text = f"❌ {interaction.user.mention} picked the wrong chest. Better luck next time."
+
+            result_text += f"\nBurned: **{format_sat_to_nns(NNS_CHEST_COST_SAT)} NNS**"
+            result_text += f"\nNext play: <t:{next_allowed_at}:R>"
+            if xp_info.get("leveled_up"):
+                result_text += f"\n🚀 Level up! Reached **Level {int(xp_info.get('new_level') or 1)}**."
+
+            private_result_text = "Treasure Chest finished. The public result has been posted in this channel."
+            private_embed = get_chest_embed(interaction.user, private_result_text, None, golden=False)
+
+            await interaction.response.edit_message(embed=private_embed, view=self)
+
+            public_result = result_text
+            if interaction.channel is not None:
+                await interaction.channel.send(public_result)
+
+        return callback
+
+    async def on_timeout(self):
+        if self.resolved:
+            return
+        self.disable_all()
+
 # ---------------------------
 # Commands
 # ---------------------------
@@ -1290,6 +1562,7 @@ async def help_cmd(interaction: discord.Interaction):
         "• `/multitip <amount> <users> [note]` – Tip the same NNS amount to multiple users\n"
         "• `/balances` – Show your internal NNS balance\n"
         "• `/claim` – Claim free NNS every hour\n"
+        "• `/treasure_chest` – Open a public 3-chest XP game for 1 NNS (burned)\n"
         "• `/profile` – Show your level, XP, and claim multiplier\n"
         "• `/leaderboard` – Show the top NNS levels\n"
         "• `/stake <amount>` – Move internal NNS into staking\n"
@@ -1300,16 +1573,57 @@ async def help_cmd(interaction: discord.Interaction):
         "• `/list_airdrops` – Show active NNS airdrops\n"
         "• `/end_airdrop <id>` – End your own airdrop and refund the remainder\n"
         "\n"
-        "Notes:\n"
-        "• Deposits and withdrawals are processed by the existing NNS watcher.\n"
-        "• This bot only writes to the shared TipBot database.\n"
-        f"• `/claim` grants **{format_sat_to_nns(NNS_CLAIM_AMOUNT_SAT)} NNS** every **{format_claim_cooldown(NNS_CLAIM_COOLDOWN_SECONDS)}**.\n"
-        "• Airdrops credit internal NNS balances when users click the button.\n"
-        f"• Staking APR: **{get_current_staking_apr():.4f}%** yearly (auto-adjusted).\n"
-        f"• APR refresh interval: **{max(300, int(NNS_STAKING_APR_REFRESH_SECONDS))} seconds**.\n"
-        f"• APR cache file (read-only): **{NNS_STAKING_APR_CACHE_FILE}**.\n"
     )
     await interaction.response.send_message(text, ephemeral=True)
+@bot.tree.command(name="treasure_chest", description="Start a public Treasure Chest game in the configured chest channel.")
+async def treasure_chest(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=False)
+
+    role_gate_error = get_role_gate_error(interaction)
+    if role_gate_error:
+        await interaction.followup.send(role_gate_error, ephemeral=True)
+        return
+
+    if not NNS_CHEST_ENABLED:
+        await interaction.followup.send("Treasure Chest is currently disabled.", ephemeral=True)
+        return
+
+    if int(NNS_CHEST_ALLOWED_CHANNEL_ID or 0) > 0 and int(interaction.channel_id or 0) != int(NNS_CHEST_ALLOWED_CHANNEL_ID):
+        await interaction.followup.send(
+            f"Treasure Chest can only be played in <#{int(NNS_CHEST_ALLOWED_CHANNEL_ID)}>.",
+            ephemeral=True,
+        )
+        return
+
+    con = db()
+    try:
+        user = get_or_create_user(con, interaction.user.id)
+        balance_sat = int(user.get("nns_internal_sat") or 0)
+        if balance_sat < int(NNS_CHEST_COST_SAT):
+            await interaction.followup.send(
+                f"Insufficient NNS balance. You need **{format_sat_to_nns(NNS_CHEST_COST_SAT)} NNS** but only have **{format_sat_to_nns(balance_sat)} NNS**.",
+                ephemeral=True,
+            )
+            return
+
+        remaining = get_chest_cooldown_remaining(con, interaction.user.id)
+        if remaining > 0:
+            await interaction.followup.send(
+                f"You can play Treasure Chest again in **{format_claim_cooldown(remaining)}**.",
+                ephemeral=True,
+            )
+            return
+    finally:
+        con.close()
+
+    embed = get_chest_embed(
+        interaction.user,
+        "Choose one chest below. Only you can see this selection. The result will be posted publicly.",
+        "Possible reward: **2–5 XP**.\nGolden chest chance: **5%** for **20 XP**.",
+        golden=False,
+    )
+    view = ChestGameView(interaction.user.id)
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 
@@ -1391,6 +1705,13 @@ async def claim(interaction: discord.Interaction):
     role_gate_error = get_role_gate_error(interaction)
     if role_gate_error:
         await interaction.followup.send(role_gate_error, ephemeral=True)
+        return
+
+    if int(NNS_CLAIM_ALLOWED_CHANNEL_ID or 0) > 0 and int(interaction.channel_id or 0) != int(NNS_CLAIM_ALLOWED_CHANNEL_ID):
+        await interaction.followup.send(
+            f"`/claim` can only be used in <#{int(NNS_CLAIM_ALLOWED_CHANNEL_ID)}>.",
+            ephemeral=True,
+        )
         return
 
     try:
@@ -1684,6 +2005,13 @@ async def tip(interaction: discord.Interaction, user: discord.User, amount: str,
         await interaction.followup.send(role_gate_error, ephemeral=True)
         return
 
+    if is_tip_blocked_recipient(int(user.id)):
+        await interaction.followup.send(
+            "Tipping to this account is disabled. Please use another destination.",
+            ephemeral=True,
+        )
+        return
+
     try:
         amount_sat = parse_nns_to_sat(amount)
         perform_nns_tip(interaction.user.id, user.id, amount_sat, note)
@@ -1789,6 +2117,15 @@ async def multitip(interaction: discord.Interaction, amount: str, users: str, no
             uniq_ids.append(did)
 
     uniq_ids = [did for did in uniq_ids if did != interaction.user.id]
+
+    blocked_ids = [did for did in uniq_ids if is_tip_blocked_recipient(did)]
+    if blocked_ids:
+        blocked_mentions = " ".join(f"<@{did}>" for did in blocked_ids)
+        await interaction.followup.send(
+            f"Multi-tip blocked. These recipients cannot receive tips: {blocked_mentions}",
+            ephemeral=True,
+        )
+        return
 
     if not uniq_ids:
         await interaction.followup.send("No valid recipients found (or you only included yourself).", ephemeral=True)

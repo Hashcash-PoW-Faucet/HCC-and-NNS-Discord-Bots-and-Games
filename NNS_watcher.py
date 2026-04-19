@@ -24,25 +24,25 @@ NNS_RPC_PASSWORD = os.environ.get("NNS_RPC_PASSWORD", "").strip()
 NNS_SATS = 100_000_000
 NNS_DEPOSIT_CONFS = int(os.environ.get("NNS_DEPOSIT_CONFS", "6"))
 
-POLL_SECONDS = int(os.environ.get("NNS_POLL_SECONDS", "15"))
+POLL_SECONDS = int(os.environ.get("NNS_POLL_SECONDS", "60"))
 
 LOG_HEARTBEAT_SECONDS = int(os.environ.get("NNS_LOG_HEARTBEAT_SECONDS", "600"))
-WITHDRAW_BATCH = int(os.environ.get("NNS_WITHDRAW_BATCH", "10"))
+WITHDRAW_BATCH = int(os.environ.get("NNS_WITHDRAW_BATCH", "1"))
 
 NNS_WITHDRAW_FEE_ADDRESS = os.environ.get("NNS_WITHDRAW_FEE_ADDRESS", "").strip()
 
-DEPOSIT_REFRESH_BATCH = int(os.environ.get("NNS_DEPOSIT_REFRESH_BATCH", "200"))
+DEPOSIT_REFRESH_BATCH = int(os.environ.get("NNS_DEPOSIT_REFRESH_BATCH", "25"))
 
-WITHDRAW_SLEEP_BETWEEN = float(os.environ.get("NNS_WITHDRAW_SLEEP", "0.2"))
+WITHDRAW_SLEEP_BETWEEN = float(os.environ.get("NNS_WITHDRAW_SLEEP", "1.0"))
 
 EXPLORER_SENDRAWTX_URL = os.environ.get("EXPLORER_SENDRAWTX_URL", "").strip()
 EXPLORER_TX_API_KEY = os.environ.get("EXPLORER_TX_API_KEY", "").strip()
 
 EXPLORER_REBROADCAST_TIMEOUT = int(os.environ.get("EXPLORER_REBROADCAST_TIMEOUT", "20"))
 NNS_RPC_TIMEOUT = int(os.environ.get("NNS_RPC_TIMEOUT", "30"))
-NNS_RPC_RETRIES = int(os.environ.get("NNS_RPC_RETRIES", "1"))
+NNS_RPC_RETRIES = int(os.environ.get("NNS_RPC_RETRIES", "0"))
 NNS_RPC_RETRY_DELAY = float(os.environ.get("NNS_RPC_RETRY_DELAY", "1.5"))
-NNS_CONFIRMATION_REFRESH_SLEEP = float(os.environ.get("NNS_CONFIRMATION_REFRESH_SLEEP", "0.05"))
+NNS_CONFIRMATION_REFRESH_SLEEP = float(os.environ.get("NNS_CONFIRMATION_REFRESH_SLEEP", "0.2"))
 
 
 # ---------------------------
@@ -127,6 +127,7 @@ def set_lastblockhash(con: sqlite3.Connection, bh: Optional[str]) -> None:
 
 
 _RPC_SESSION: Optional[aiohttp.ClientSession] = None
+_RPC_LOCK = asyncio.Lock()
 
 
 async def get_rpc_session() -> aiohttp.ClientSession:
@@ -160,30 +161,31 @@ async def nns_rpc_call(method: str, params: Optional[List[Any]] = None) -> Any:
     attempts = max(1, int(NNS_RPC_RETRIES) + 1)
     last_err: Optional[Exception] = None
 
-    for attempt in range(1, attempts + 1):
-        try:
-            session = await get_rpc_session()
-            async with session.post(NNS_RPC_URL, json=payload) as r:
-                txt = await r.text()
-                if r.status != 200:
-                    raise RuntimeError(f"996-Coin RPC HTTP {r.status}: {txt}")
-                data = json.loads(txt)
-                if data.get("error"):
-                    raise RuntimeError(f"996-Coin RPC error: {data['error']}")
-                return data.get("result")
-        except Exception as e:
-            last_err = e
-            msg = str(e)
-            transient = (
-                isinstance(e, aiohttp.ClientError)
-                or isinstance(e, asyncio.TimeoutError)
-                or "work queue depth exceeded" in msg.lower()
-                or "cannot connect to host" in msg.lower()
-                or "server disconnected" in msg.lower()
-            )
-            if attempt >= attempts or not transient:
-                break
-            await asyncio.sleep(max(0.0, float(NNS_RPC_RETRY_DELAY)))
+    async with _RPC_LOCK:
+        for attempt in range(1, attempts + 1):
+            try:
+                session = await get_rpc_session()
+                async with session.post(NNS_RPC_URL, json=payload) as r:
+                    txt = await r.text()
+                    if r.status != 200:
+                        raise RuntimeError(f"996-Coin RPC HTTP {r.status}: {txt}")
+                    data = json.loads(txt)
+                    if data.get("error"):
+                        raise RuntimeError(f"996-Coin RPC error: {data['error']}")
+                    return data.get("result")
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                transient = (
+                    isinstance(e, aiohttp.ClientError)
+                    or isinstance(e, asyncio.TimeoutError)
+                    or "work queue depth exceeded" in msg.lower()
+                    or "cannot connect to host" in msg.lower()
+                    or "server disconnected" in msg.lower()
+                )
+                if attempt >= attempts or not transient:
+                    break
+                await asyncio.sleep(max(0.0, float(NNS_RPC_RETRY_DELAY)))
 
     raise RuntimeError(str(last_err) if last_err else "unknown RPC error")
 
@@ -418,7 +420,7 @@ async def process_withdrawals() -> Tuple[int, int]:
     try:
         rows = con.execute(
             "SELECT id, discord_id, to_address, amount_sat, fee_sat FROM nns_withdrawals WHERE status='pending' ORDER BY id ASC LIMIT ?",
-            (int(WITHDRAW_BATCH),)
+            (1,)
         ).fetchall()
     finally:
         con.close()
@@ -531,15 +533,19 @@ async def main_loop() -> None:
     print("nns_watcher started")
     print(f"DB={DB_PATH}")
     print(f"RPC={NNS_RPC_URL}")
-    print(f"DEPOSIT_CONFS={NNS_DEPOSIT_CONFS} POLL_SECONDS={POLL_SECONDS} WITHDRAW_BATCH={WITHDRAW_BATCH}")
+    print(
+        f"DEPOSIT_CONFS={NNS_DEPOSIT_CONFS} POLL_SECONDS={POLL_SECONDS} "
+        f"WITHDRAW_BATCH=1 DEPOSIT_REFRESH_BATCH={DEPOSIT_REFRESH_BATCH} "
+        f"NNS_RPC_RETRIES={NNS_RPC_RETRIES}"
+    )
 
     last_log_ts = 0
 
     try:
         while True:
             try:
-                seen, credited = await process_deposits()
                 sent, failed = await process_withdrawals()
+                seen, credited = await process_deposits()
 
                 if should_log_status(seen, credited, sent, failed, last_log_ts):
                     print(
