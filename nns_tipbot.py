@@ -1681,7 +1681,7 @@ async def leaderboard(interaction: discord.Interaction):
     con = db()
     try:
         rows = con.execute(
-            "SELECT discord_id, xp_total, level FROM nns_profiles ORDER BY level DESC, xp_total DESC, discord_id ASC LIMIT 10"
+            "SELECT discord_id, xp_total, level FROM nns_profiles ORDER BY level DESC, xp_total DESC, discord_id ASC LIMIT 20"
         ).fetchall()
     finally:
         con.close()
