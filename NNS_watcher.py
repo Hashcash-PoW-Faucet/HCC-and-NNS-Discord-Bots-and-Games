@@ -26,12 +26,16 @@ NNS_DEPOSIT_CONFS = int(os.environ.get("NNS_DEPOSIT_CONFS", "6"))
 
 POLL_SECONDS = int(os.environ.get("NNS_POLL_SECONDS", "60"))
 
+DEPOSIT_POLL_SECONDS = int(os.environ.get("NNS_DEPOSIT_POLL_SECONDS", "300"))
+CONFIRMATION_REFRESH_INTERVAL_SECONDS = int(os.environ.get("NNS_CONFIRMATION_REFRESH_INTERVAL_SECONDS", "1800"))
+ENABLE_EXPLORER_REBROADCAST = os.environ.get("NNS_ENABLE_EXPLORER_REBROADCAST", "1").strip() == "1"
+
 LOG_HEARTBEAT_SECONDS = int(os.environ.get("NNS_LOG_HEARTBEAT_SECONDS", "600"))
 WITHDRAW_BATCH = int(os.environ.get("NNS_WITHDRAW_BATCH", "1"))
 
 NNS_WITHDRAW_FEE_ADDRESS = os.environ.get("NNS_WITHDRAW_FEE_ADDRESS", "").strip()
 
-DEPOSIT_REFRESH_BATCH = int(os.environ.get("NNS_DEPOSIT_REFRESH_BATCH", "25"))
+DEPOSIT_REFRESH_BATCH = int(os.environ.get("NNS_DEPOSIT_REFRESH_BATCH", "5"))
 
 WITHDRAW_SLEEP_BETWEEN = float(os.environ.get("NNS_WITHDRAW_SLEEP", "1.0"))
 
@@ -42,7 +46,11 @@ EXPLORER_REBROADCAST_TIMEOUT = int(os.environ.get("EXPLORER_REBROADCAST_TIMEOUT"
 NNS_RPC_TIMEOUT = int(os.environ.get("NNS_RPC_TIMEOUT", "30"))
 NNS_RPC_RETRIES = int(os.environ.get("NNS_RPC_RETRIES", "0"))
 NNS_RPC_RETRY_DELAY = float(os.environ.get("NNS_RPC_RETRY_DELAY", "1.5"))
-NNS_CONFIRMATION_REFRESH_SLEEP = float(os.environ.get("NNS_CONFIRMATION_REFRESH_SLEEP", "0.2"))
+
+NNS_CONFIRMATION_REFRESH_SLEEP = float(os.environ.get("NNS_CONFIRMATION_REFRESH_SLEEP", "1.0"))
+NNS_WITHDRAW_RETRY_BASE_SECONDS = int(os.environ.get("NNS_WITHDRAW_RETRY_BASE_SECONDS", "300"))
+NNS_WITHDRAW_RETRY_MAX_SECONDS = int(os.environ.get("NNS_WITHDRAW_RETRY_MAX_SECONDS", "7200"))
+NNS_WITHDRAW_MAX_RETRIES = int(os.environ.get("NNS_WITHDRAW_MAX_RETRIES", "8"))
 
 
 # ---------------------------
@@ -102,6 +110,18 @@ def init_db() -> None:
       PRIMARY KEY(txid, vout)
     );
     """)
+    try:
+        con.execute("ALTER TABLE nns_withdrawals ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;")
+    except Exception:
+        pass
+    try:
+        con.execute("ALTER TABLE nns_withdrawals ADD COLUMN next_retry_at INTEGER;")
+    except Exception:
+        pass
+    try:
+        con.execute("ALTER TABLE nns_withdrawals ADD COLUMN last_attempt_ts INTEGER;")
+    except Exception:
+        pass
     row = con.execute("SELECT id FROM nns_watcher_state WHERE id=1").fetchone()
     if not row:
         con.execute(
@@ -140,11 +160,32 @@ async def get_rpc_session() -> aiohttp.ClientSession:
     return _RPC_SESSION
 
 
+
 async def close_rpc_session() -> None:
     global _RPC_SESSION
     if _RPC_SESSION is not None and not _RPC_SESSION.closed:
         await _RPC_SESSION.close()
     _RPC_SESSION = None
+
+
+def is_transient_withdraw_error(message: str) -> bool:
+    msg = (message or "").lower()
+    return (
+        "work queue depth exceeded" in msg
+        or "http 503" in msg
+        or "server disconnected" in msg
+        or "cannot connect to host" in msg
+        or "timeout" in msg
+        or "temporar" in msg
+        or "busy" in msg
+    )
+
+
+def compute_withdraw_retry_delay(retry_count: int) -> int:
+    base = max(30, int(NNS_WITHDRAW_RETRY_BASE_SECONDS))
+    max_delay = max(base, int(NNS_WITHDRAW_RETRY_MAX_SECONDS))
+    delay = base * (2 ** max(0, int(retry_count)))
+    return min(delay, max_delay)
 
 
 async def nns_rpc_call(method: str, params: Optional[List[Any]] = None) -> Any:
@@ -329,7 +370,7 @@ async def refresh_uncredited_confirmations(con: sqlite3.Connection) -> int:
     return updated
 
 
-async def process_deposits() -> Tuple[int, int]:
+async def process_deposits(do_confirmation_refresh: bool = False) -> Tuple[int, int]:
     con = db()
     try:
         addr_map = load_address_map(con)
@@ -345,9 +386,23 @@ async def process_deposits() -> Tuple[int, int]:
             res = await nns_rpc_call("listsinceblock", [last_bh])
         else:
             res = await nns_rpc_call("listsinceblock", [])
-    except Exception:
-        if last_bh:
-            res = await nns_rpc_call("listsinceblock", [last_bh, 1, True])
+    except Exception as e:
+        msg = str(e)
+        if last_bh and "block not found" in msg.lower():
+            con_reset = db()
+            try:
+                con_reset.execute("BEGIN IMMEDIATE;")
+                set_lastblockhash(con_reset, None)
+                con_reset.execute("COMMIT;")
+            except Exception:
+                try:
+                    con_reset.execute("ROLLBACK;")
+                except Exception:
+                    pass
+            finally:
+                con_reset.close()
+            print(f"[process_deposits] stored lastblockhash not found, resetting watcher state: {last_bh}", flush=True)
+            res = await nns_rpc_call("listsinceblock", [])
         else:
             res = await nns_rpc_call("listsinceblock", [None, 1, True])
 
@@ -390,7 +445,8 @@ async def process_deposits() -> Tuple[int, int]:
             upsert_deposit_seen(con2, txid, vout, addr_map[addr], addr, amt_sat, confs)
             seen += 1
 
-        await refresh_uncredited_confirmations(con2)
+        if do_confirmation_refresh:
+            await refresh_uncredited_confirmations(con2)
 
         rows = con2.execute(
             "SELECT txid, vout FROM nns_deposits WHERE credited=0 AND confirmations >= ?",
@@ -419,8 +475,12 @@ async def process_withdrawals() -> Tuple[int, int]:
     con = db()
     try:
         rows = con.execute(
-            "SELECT id, discord_id, to_address, amount_sat, fee_sat FROM nns_withdrawals WHERE status='pending' ORDER BY id ASC LIMIT ?",
-            (1,)
+            "SELECT id, discord_id, to_address, amount_sat, fee_sat, COALESCE(retry_count, 0), next_retry_at "
+            "FROM nns_withdrawals "
+            "WHERE status IN ('pending','retry') "
+            "AND (next_retry_at IS NULL OR next_retry_at <= ?) "
+            "ORDER BY id ASC LIMIT ?",
+            (now_ts(), 1)
         ).fetchall()
     finally:
         con.close()
@@ -431,12 +491,13 @@ async def process_withdrawals() -> Tuple[int, int]:
     sent = 0
     failed = 0
 
-    for wid, discord_id, to_addr, amount_sat, fee_sat in rows:
+    for wid, discord_id, to_addr, amount_sat, fee_sat, retry_count, next_retry_at in rows:
         wid = int(wid)
         discord_id = int(discord_id)
         to_addr = str(to_addr).strip()
         amount_sat = int(amount_sat)
         fee_sat = int(fee_sat or 0)
+        retry_count = int(retry_count or 0)
 
         txid: Optional[str] = None
         err: Optional[str] = None
@@ -460,7 +521,7 @@ async def process_withdrawals() -> Tuple[int, int]:
                 raise RuntimeError("withdraw broadcast returned invalid txid")
             txid = txid.strip()
 
-            if EXPLORER_SENDRAWTX_URL:
+            if ENABLE_EXPLORER_REBROADCAST and EXPLORER_SENDRAWTX_URL:
                 try:
                     raw_hex = await get_raw_tx_hex(txid)
                     explorer_res = await explorer_rebroadcast_raw_tx(raw_hex)
@@ -477,7 +538,7 @@ async def process_withdrawals() -> Tuple[int, int]:
         try:
             con2.execute("BEGIN IMMEDIATE;")
             row = con2.execute(
-                "SELECT status, discord_id, amount_sat, fee_sat FROM nns_withdrawals WHERE id=?",
+                "SELECT status, discord_id, amount_sat, fee_sat, COALESCE(retry_count, 0) FROM nns_withdrawals WHERE id=?",
                 (wid,)
             ).fetchone()
             if not row:
@@ -488,31 +549,48 @@ async def process_withdrawals() -> Tuple[int, int]:
             did_now = int(row[1])
             amt_now = int(row[2])
             fee_now = int(row[3] or 0)
+            retry_count_now = int(row[4] or 0)
 
-            if status_now != "pending":
+            if status_now not in ("pending", "retry"):
                 con2.execute("ROLLBACK;")
                 continue
 
             if txid:
                 con2.execute(
-                    "UPDATE nns_withdrawals SET status='sent', txid=?, error=? WHERE id=?",
-                    (txid, rebroadcast_note, wid)
+                    "UPDATE nns_withdrawals SET status='sent', txid=?, error=?, retry_count=0, next_retry_at=NULL, last_attempt_ts=? WHERE id=?",
+                    (txid, rebroadcast_note, now_ts(), wid)
                 )
                 con2.execute("COMMIT;")
                 sent += 1
                 if rebroadcast_note:
                     print(f"[withdraw {wid}] {rebroadcast_note}", flush=True)
             else:
-                con2.execute(
-                    "UPDATE nns_withdrawals SET status='failed', error=? WHERE id=?",
-                    (err or "unknown error", wid)
-                )
-                con2.execute(
-                    "UPDATE users SET nns_internal_sat = nns_internal_sat + ?, updated_at=? WHERE discord_id=?",
-                    (int(amt_now) + int(fee_now), now_ts(), did_now)
-                )
-                con2.execute("COMMIT;")
-                failed += 1
+                err_msg = err or "unknown error"
+                transient = is_transient_withdraw_error(err_msg)
+                ts_now = now_ts()
+
+                if transient and retry_count_now < int(NNS_WITHDRAW_MAX_RETRIES):
+                    next_retry = ts_now + compute_withdraw_retry_delay(retry_count_now)
+                    con2.execute(
+                        "UPDATE nns_withdrawals SET status='retry', error=?, retry_count=?, next_retry_at=?, last_attempt_ts=? WHERE id=?",
+                        (err_msg, retry_count_now + 1, next_retry, ts_now, wid)
+                    )
+                    con2.execute("COMMIT;")
+                    print(
+                        f"[withdraw {wid}] transient failure -> retry {retry_count_now + 1}/{int(NNS_WITHDRAW_MAX_RETRIES)} in {max(0, next_retry - ts_now)}s: {err_msg}",
+                        flush=True,
+                    )
+                else:
+                    con2.execute(
+                        "UPDATE nns_withdrawals SET status='failed', error=?, last_attempt_ts=? WHERE id=?",
+                        (err_msg, ts_now, wid)
+                    )
+                    con2.execute(
+                        "UPDATE users SET nns_internal_sat = nns_internal_sat + ?, updated_at=? WHERE discord_id=?",
+                        (int(amt_now) + int(fee_now), ts_now, did_now)
+                    )
+                    con2.execute("COMMIT;")
+                    failed += 1
 
         except Exception:
             try:
@@ -535,17 +613,33 @@ async def main_loop() -> None:
     print(f"RPC={NNS_RPC_URL}")
     print(
         f"DEPOSIT_CONFS={NNS_DEPOSIT_CONFS} POLL_SECONDS={POLL_SECONDS} "
+        f"DEPOSIT_POLL_SECONDS={DEPOSIT_POLL_SECONDS} "
+        f"CONFIRMATION_REFRESH_INTERVAL_SECONDS={CONFIRMATION_REFRESH_INTERVAL_SECONDS} "
         f"WITHDRAW_BATCH=1 DEPOSIT_REFRESH_BATCH={DEPOSIT_REFRESH_BATCH} "
-        f"NNS_RPC_RETRIES={NNS_RPC_RETRIES}"
+        f"NNS_RPC_RETRIES={NNS_RPC_RETRIES} ENABLE_EXPLORER_REBROADCAST={ENABLE_EXPLORER_REBROADCAST} "
+        f"NNS_WITHDRAW_MAX_RETRIES={NNS_WITHDRAW_MAX_RETRIES}"
     )
 
     last_log_ts = 0
+    last_deposit_poll_ts = 0
+    last_confirmation_refresh_ts = 0
 
     try:
         while True:
             try:
                 sent, failed = await process_withdrawals()
-                seen, credited = await process_deposits()
+
+                seen = 0
+                credited = 0
+                now = now_ts()
+                should_poll_deposits = (now - int(last_deposit_poll_ts)) >= max(60, int(DEPOSIT_POLL_SECONDS))
+                should_refresh_confirmations = (now - int(last_confirmation_refresh_ts)) >= max(300, int(CONFIRMATION_REFRESH_INTERVAL_SECONDS))
+
+                if should_poll_deposits:
+                    seen, credited = await process_deposits(do_confirmation_refresh=should_refresh_confirmations)
+                    last_deposit_poll_ts = now
+                    if should_refresh_confirmations:
+                        last_confirmation_refresh_ts = now
 
                 if should_log_status(seen, credited, sent, failed, last_log_ts):
                     print(
